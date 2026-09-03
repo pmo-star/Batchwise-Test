@@ -1,0 +1,722 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Batchwise Tracker</title>
+<style>
+  :root {
+    --bg: #F7F5F1;
+    --surface: #FFFFFF;
+    --surface-2: #FBFAF7;
+    --ink: #1C1B19;
+    --ink-2: #6B655C;
+    --ink-3: #9A9284;
+    --line: #E7E2D8;
+    --line-strong: #D6CFC0;
+    --accent: #B54E2E;
+    --accent-ink: #FFFFFF;
+    --accent-soft: #F3E2DA;
+    --danger: #A3372F;
+    --danger-soft: #F6E2E0;
+    --radius: 8px;
+    --shadow: none;
+    --focus: 0 0 0 3px rgba(181,78,46,0.28);
+  }
+  html.dark {
+    --bg: #15171A;
+    --surface: #1D2024;
+    --surface-2: #202327;
+    --ink: #ECE9E2;
+    --ink-2: #A19A8C;
+    --ink-3: #746D62;
+    --line: #2B2E33;
+    --line-strong: #383B41;
+    --accent: #D97A52;
+    --accent-ink: #15171A;
+    --accent-soft: #382820;
+    --danger: #E0685F;
+    --danger-soft: #3A2422;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif;
+    font-size: 14px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .mono { font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace; }
+  ::selection { background: var(--accent-soft); }
+  button, input, select { font-family: inherit; font-size: inherit; color: inherit; }
+  button { cursor: pointer; }
+  ::-webkit-scrollbar { height: 8px; width: 8px; }
+  ::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: 4px; }
+  a { color: var(--accent); }
+
+  .focus-ring:focus-visible { outline: none; box-shadow: var(--focus); border-radius: var(--radius); }
+
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+  .spin { animation: spin 0.7s linear infinite; }
+  .fade-in { animation: fadeIn 0.15s ease-out; }
+
+  @media (prefers-reduced-motion: reduce) {
+    .spin { animation: none; }
+    .fade-in { animation: none; }
+  }
+</style>
+</head>
+<body>
+<div id="root"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+
+<script type="text/babel-jsx" id="app-source">
+const { useState, useEffect, useMemo, useCallback, useRef } = React;
+
+if (typeof pdfjsLib !== 'undefined') {
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+}
+
+/* ============================================================
+   CONFIG
+============================================================ */
+const GOOGLE_SHEET_API_URL = 'https://script.google.com/macros/s/AKfycbzkfY8LRSrbi7gsWXYjXYnu_h5C31uPJibO2Nm7sDuNtF493GhTuI8JAj4uAVL5gUvh/exec';
+
+const GROUP_MAP = {
+  ZCCP: 'CCP / Mill', ZMILL: 'CCP / Mill', ZPULV: 'CCP / Mill', ZCH01: 'CCP / Mill',
+  ZCOIN: 'Coin', ZCL01: 'Coil (CL01)', ZCUP: 'Cup', ZCASE: 'Case'
+};
+const DEPARTMENTS = ['CCP / Mill', 'Coin', 'Coil (CL01)', 'Cup', 'Case'];
+
+/* ============================================================
+   STORAGE (Google Sheet backend, in-memory cache)
+============================================================ */
+const cache = {};
+async function sheetGet(key) {
+  if (Object.prototype.hasOwnProperty.call(cache, key)) return cache[key];
+  const res = await fetch(GOOGLE_SHEET_API_URL + '?key=' + encodeURIComponent(key));
+  const json = await res.json();
+  const val = json && json.value !== undefined ? json.value : null;
+  cache[key] = val;
+  return val;
+}
+async function sheetSet(key, value) {
+  cache[key] = value;
+  await fetch(GOOGLE_SHEET_API_URL, { method: 'POST', body: JSON.stringify({ action: 'set', key, value }) });
+}
+async function getDateIndex() {
+  const raw = await sheetGet('date-index');
+  try { return raw ? JSON.parse(raw) : []; } catch (e) { return []; }
+}
+async function setDateIndex(list) { await sheetSet('date-index', JSON.stringify(list)); }
+async function getDayRows(dateKey) {
+  const raw = await sheetGet('rows:' + dateKey);
+  try { return raw ? JSON.parse(raw) : []; } catch (e) { return []; }
+}
+async function setDayRows(dateKey, rows) { await sheetSet('rows:' + dateKey, JSON.stringify(rows)); }
+
+/* ============================================================
+   PARSING
+============================================================ */
+function findCol(headers, exact, contains, exclude) {
+  const lower = headers.map(h => (h || '').toString().toLowerCase().trim());
+  if (exact) {
+    for (const name of exact) {
+      const idx = lower.indexOf(name.toLowerCase());
+      if (idx !== -1) return idx;
+    }
+  }
+  if (contains) {
+    for (let i = 0; i < lower.length; i++) {
+      const h = lower[i];
+      if (contains.every(k => h.includes(k)) && !(exclude || []).some(k => h.includes(k))) return i;
+    }
+  }
+  return -1;
+}
+
+function dateToKey(val) {
+  if (typeof val === 'number' && isFinite(val)) {
+    const ms = Date.UTC(1899, 11, 30) + Math.round(val) * 86400000;
+    const d = new Date(ms);
+    return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+  }
+  if (val instanceof Date && !isNaN(val)) {
+    return val.getUTCFullYear() + '-' + String(val.getUTCMonth() + 1).padStart(2, '0') + '-' + String(val.getUTCDate()).padStart(2, '0');
+  }
+  if (typeof val === 'string') {
+    const s = val.trim();
+    let m = s.match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+    if (m) return m[3] + '-' + m[1].padStart(2, '0') + '-' + m[2].padStart(2, '0');
+    m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+    if (m) return m[1] + '-' + m[2].padStart(2, '0') + '-' + m[3].padStart(2, '0');
+    const d = new Date(s);
+    if (!isNaN(d)) return d.getUTCFullYear() + '-' + String(d.getUTCMonth() + 1).padStart(2, '0') + '-' + String(d.getUTCDate()).padStart(2, '0');
+  }
+  return 'unknown';
+}
+function keyToLabel(key) {
+  if (key === 'unknown') return 'Unknown date';
+  const [y, m, d] = key.split('-');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return d + ' ' + months[parseInt(m, 10) - 1] + ' ' + y;
+}
+
+function num(v) { const n = parseFloat(v); return isFinite(n) ? n : 0; }
+
+async function extractRowsFromPdf(arrayBuffer) {
+  const data = new Uint8Array(arrayBuffer);
+  const pdf = await pdfjsLib.getDocument({ data }).promise;
+
+  const dataRows = [];
+  let headerRow = null;
+
+  for (let p = 1; p <= pdf.numPages; p++) {
+    const page = await pdf.getPage(p);
+    const content = await page.getTextContent();
+
+    const rowMap = {};
+    content.items.forEach(item => {
+      const y = Math.round(item.transform[5]);
+      const x = item.transform[4];
+      if (!rowMap[y]) rowMap[y] = [];
+      if (item.str.trim() !== '') rowMap[y].push({ x, str: item.str });
+    });
+
+    const sortedYs = Object.keys(rowMap).map(Number).sort((a, b) => b - a);
+    sortedYs.forEach(y => {
+      const cells = rowMap[y].sort((a, b) => a.x - b.x).map(c => c.str);
+      // title lines and page-number lines never have anywhere near the
+      // full column count, so this alone filters them out reliably.
+      if (cells.length < 10) return;
+      if (cells[0] === 'Company Code') {
+        // repeated header row (appears on every page) — capture once, skip as data
+        if (!headerRow) headerRow = cells;
+        return;
+      }
+      dataRows.push(cells);
+    });
+  }
+
+  if (!headerRow) throw new Error('Could not find the header row in this PDF.');
+  if (!dataRows.length) throw new Error('No data rows found in this PDF.');
+
+  return [headerRow, ...dataRows];
+}
+
+async function parseWorkbook(arrayBuffer, isPdf) {
+  let rows;
+
+  if (isPdf) {
+    rows = await extractRowsFromPdf(arrayBuffer);
+  } else {
+    const wb = XLSX.read(new Uint8Array(arrayBuffer), { type: 'array', cellDates: false, cellNF: true });
+    const sheet = wb.Sheets[wb.SheetNames[0]];
+    rows = XLSX.utils.sheet_to_json(sheet, { header: 1, raw: true, defval: null });
+  }
+
+  if (!rows.length) throw new Error('File is empty.');
+  const headers = rows[0];
+  const dataRows = rows.slice(1).filter(r => r && r.length);
+
+  const locCol = findCol(headers, ['Storage Location'], ['storage', 'location']);
+  const wcCol = findCol(headers, ['Work Center Text'], ['work', 'center'], ['code']);
+  const matCol = findCol(headers, ['Material Group'], ['material', 'group']);
+  const batchCol = findCol(headers, ['Batch']);
+  const dateCol = findCol(headers, ['Posting Date'], ['posting', 'date']);
+  const qtyCol = findCol(headers, null, ['qty'], ['unit']);
+  const storeDCol = findCol(headers, ['Store Direct Amount'], ['store', 'direct'], ['rs/kg', 'indirect']);
+  const storeICol = findCol(headers, ['Store Indirect Amount'], ['store', 'indirect'], ['rs/kg']);
+  const powerDCol = findCol(headers, ['Power Direct Amount'], ['power', 'direct'], ['rs/kg', 'indirect']);
+  const powerICol = findCol(headers, ['Power Indirect Amount'], ['power', 'indirect'], ['rs/kg']);
+  const labDCol = findCol(headers, ['Labour Direct Amount'], ['labour', 'direct'], ['rs/kg', 'indirect']);
+  const labICol = findCol(headers, ['Labour Indirect Amount'], ['labour', 'indirect'], ['rs/kg']);
+  const totalCol = findCol(headers, ['Total Amount (Direct + Indirect)', 'Total Amount'], ['total', 'amount'], ['rs/kg', 'direct)', 'indirect)']);
+
+  if (locCol === -1 || wcCol === -1) throw new Error('Could not find Storage Location / Work Center columns in this file.');
+
+  const byDate = {};
+  dataRows.forEach(r => {
+    const dateKey = dateCol !== -1 ? dateToKey(r[dateCol]) : 'unknown';
+    const loc = (r[locCol] || '').toString().trim();
+    const dept = GROUP_MAP[loc] || loc || 'Other';
+    const wc = (r[wcCol] || 'Unknown').toString().trim();
+    const mat = matCol !== -1 ? (r[matCol] || '').toString().trim() : '';
+    const batch = batchCol !== -1 ? (r[batchCol] || '').toString().trim() : '';
+    const row = {
+      dept, wc, mat: mat || null, batch: batch || null,
+      qty: qtyCol !== -1 ? num(r[qtyCol]) : 0,
+      storeD: storeDCol !== -1 ? num(r[storeDCol]) : 0,
+      storeI: storeICol !== -1 ? num(r[storeICol]) : 0,
+      labD: labDCol !== -1 ? num(r[labDCol]) : 0,
+      labI: labICol !== -1 ? num(r[labICol]) : 0,
+      powerD: powerDCol !== -1 ? num(r[powerDCol]) : 0,
+      powerI: powerICol !== -1 ? num(r[powerICol]) : 0,
+      total: totalCol !== -1 ? num(r[totalCol]) : 0
+    };
+    if (!byDate[dateKey]) byDate[dateKey] = [];
+    byDate[dateKey].push(row);
+  });
+  return byDate;
+}
+
+/* ============================================================
+   AGGREGATION
+============================================================ */
+function aggregateBy(rows, keyFn) {
+  const buckets = {};
+  rows.forEach(r => {
+    const k = keyFn(r);
+    if (!k) return;
+    if (!buckets[k]) buckets[k] = { name: k, count: 0, qty: 0, storeD: 0, storeI: 0, labD: 0, labI: 0, powerD: 0, powerI: 0, total: 0, wc: r.wc };
+    const b = buckets[k];
+    b.count++;
+    ['qty','storeD','storeI','labD','labI','powerD','powerI','total'].forEach(f => b[f] += r[f]);
+  });
+  return Object.values(buckets)
+    .map(b => ({ ...b, rate: b.qty ? b.total / b.qty : 0 }))
+    .sort((a, b) => b.qty - a.qty);
+}
+
+/* ============================================================
+   SMALL UI PRIMITIVES
+============================================================ */
+function IconSearch() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>;
+}
+function IconX() {
+  return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>;
+}
+function IconUpload() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>;
+}
+function IconMoon() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>;
+}
+function IconSun() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>;
+}
+
+function Chip({ label, onRemove }) {
+  return (
+    <span style={{
+      display: 'inline-flex', alignItems: 'center', gap: 6,
+      background: 'var(--accent-soft)', color: 'var(--accent)', fontWeight: 600,
+      fontSize: 12.5, padding: '5px 8px 5px 10px', borderRadius: 999
+    }}>
+      {label}
+      <button onClick={onRemove} className="focus-ring" aria-label={'Remove filter: ' + label}
+        style={{ background: 'none', border: 'none', color: 'inherit', display: 'flex', padding: 2, borderRadius: 999 }}>
+        <IconX />
+      </button>
+    </span>
+  );
+}
+
+/* ============================================================
+   MAIN APP
+============================================================ */
+function App() {
+  const [theme, setTheme] = useState(() => localStorage.getItem('bwt-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+  const [dateIndex, setDates] = useState([]);
+  const [selectedDate, setSelectedDate] = useState(null);
+  const [department, setDepartment] = useState('CCP / Mill');
+  const [view, setView] = useState('wc');
+  const [search, setSearch] = useState('');
+  const [rows, setRows] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
+  const [uploading, setUploading] = useState(false);
+  const [toast, setToast] = useState(null);
+  const fileInputRef = useRef(null);
+
+  useEffect(() => {
+    document.documentElement.classList.toggle('dark', theme === 'dark');
+    localStorage.setItem('bwt-theme', theme);
+  }, [theme]);
+
+  const showToast = useCallback((msg, isError) => {
+    setToast({ msg, isError });
+    setTimeout(() => setToast(t => (t && t.msg === msg ? null : t)), isError ? 5000 : 3000);
+  }, []);
+
+  const loadDates = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      const idx = await getDateIndex();
+      const sorted = idx.slice().sort().reverse();
+      setDates(sorted);
+      setSelectedDate(prev => (prev && sorted.includes(prev)) ? prev : (sorted[0] || null));
+      if (!sorted.length) setRows([]);
+    } catch (e) {
+      setError('Could not reach the data source. Check your connection and try again.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => { loadDates(); }, [loadDates]);
+
+  useEffect(() => {
+    if (!selectedDate) return;
+    let cancelled = false;
+    setLoading(true); setError(null);
+    getDayRows(selectedDate)
+      .then(r => { if (!cancelled) { setRows(r); setLoading(false); } })
+      .catch(() => { if (!cancelled) { setError('Could not load data for this date.'); setLoading(false); } });
+    return () => { cancelled = true; };
+  }, [selectedDate]);
+
+  const handleFile = useCallback(async (file) => {
+    setUploading(true);
+    try {
+      const buf = await file.arrayBuffer();
+      const isPdf = file.name.toLowerCase().endsWith('.pdf');
+      const byDate = await parseWorkbook(buf, isPdf);
+      const dates = Object.keys(byDate);
+      if (!dates.length) throw new Error('No usable rows found in this file.');
+      const idx = await getDateIndex();
+      for (const dk of dates) {
+        const existing = await getDayRows(dk).catch(() => []);
+        const merged = existing.filter(r => true).concat(byDate[dk]);
+        await setDayRows(dk, byDate[dk]);
+        if (!idx.includes(dk)) idx.push(dk);
+      }
+      idx.sort().reverse();
+      await setDateIndex(idx);
+      showToast('Loaded ' + dates.map(keyToLabel).join(', '));
+      setSelectedDate(dates.sort().reverse()[0]);
+      await loadDates();
+    } catch (e) {
+      showToast(e.message || 'Upload failed.', true);
+    } finally {
+      setUploading(false);
+    }
+  }, [loadDates, showToast]);
+
+  const deptRows = useMemo(() => (rows || []).filter(r => r.dept === department), [rows, department]);
+  const hasBatch = useMemo(() => deptRows.some(r => r.batch), [deptRows]);
+
+  useEffect(() => {
+    if (view === 'batch' && !hasBatch) setView('wc');
+  }, [hasBatch, view]);
+
+  const aggregated = useMemo(() => {
+    if (view === 'wc') return aggregateBy(deptRows, r => r.wc);
+    if (view === 'alloy') return aggregateBy(deptRows, r => r.mat || 'Unspecified');
+    if (view === 'batch') return aggregateBy(deptRows, r => r.batch);
+    return [];
+  }, [deptRows, view]);
+
+  const filtered = useMemo(() => {
+    if (!search.trim()) return aggregated;
+    const q = search.trim().toLowerCase();
+    return aggregated.filter(r => r.name.toLowerCase().includes(q) || (r.wc || '').toLowerCase().includes(q));
+  }, [aggregated, search]);
+
+  const totals = useMemo(() => {
+    return deptRows.reduce((acc, r) => {
+      acc.qty += r.qty; acc.total += r.total; return acc;
+    }, { qty: 0, total: 0 });
+  }, [deptRows]);
+
+  const activeFilters = [];
+  if (search.trim()) activeFilters.push({ key: 'search', label: 'Search: "' + search.trim() + '"', clear: () => setSearch('') });
+
+  const fmt = n => Math.round(n).toLocaleString('en-IN');
+  const fmtRate = n => n.toFixed(2);
+
+  const COLS_AGG = [
+    ['name', view === 'batch' ? 'Batch' : 'Name', 'left'],
+    ...(view === 'batch' ? [['wc', 'Work center', 'left']] : [['count', 'Entries', 'right']]),
+    ['qty', 'Qty (kg)', 'right'],
+    ['storeD', 'Store direct', 'right'],
+    ['storeI', 'Store indirect', 'right'],
+    ['labD', 'Labour direct', 'right'],
+    ['labI', 'Labour indirect', 'right'],
+    ['powerD', 'Power direct', 'right'],
+    ['powerI', 'Power indirect', 'right'],
+    ['total', 'Total cost', 'right'],
+    ['rate', 'Rs / kg', 'right']
+  ];
+
+  return (
+    <div style={{ minHeight: '100vh' }}>
+      <TopBar
+        theme={theme} setTheme={setTheme}
+        search={search} setSearch={setSearch}
+        onUploadClick={() => fileInputRef.current && fileInputRef.current.click()}
+        uploading={uploading}
+      />
+      <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.pdf" style={{ display: 'none' }}
+        onChange={e => { if (e.target.files[0]) handleFile(e.target.files[0]); e.target.value = ''; }} />
+
+      <main style={{ maxWidth: 1200, margin: '0 auto', padding: '20px 24px 64px' }}>
+
+        <FilterBar
+          dateIndex={dateIndex} selectedDate={selectedDate} setSelectedDate={setSelectedDate}
+          department={department} setDepartment={setDepartment}
+          view={view} setView={setView} hasBatch={hasBatch}
+        />
+
+        {activeFilters.length > 0 && (
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', margin: '2px 0 16px' }}>
+            {activeFilters.map(f => <Chip key={f.key} label={f.label} onRemove={f.clear} />)}
+            <button onClick={() => activeFilters.forEach(f => f.clear())} className="focus-ring"
+              style={{ background: 'none', border: 'none', color: 'var(--ink-2)', fontSize: 12.5, fontWeight: 600, padding: '4px 6px' }}>
+              Clear all
+            </button>
+          </div>
+        )}
+
+        {!loading && !error && rows && rows.length > 0 && (
+          <StatRow qty={totals.qty} total={totals.total} entries={deptRows.length} fmt={fmt} />
+        )}
+
+        <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
+          {loading ? (
+            <LoadingState />
+          ) : error ? (
+            <ErrorState message={error} onRetry={loadDates} />
+          ) : !dateIndex.length ? (
+            <EmptyState
+              title="No data yet"
+              body="Upload a cost-sheet export to see work-center, alloy, and batch breakdowns here."
+              actionLabel="Upload a file"
+              onAction={() => fileInputRef.current && fileInputRef.current.click()}
+            />
+          ) : filtered.length === 0 ? (
+            <EmptyState
+              title={search ? 'No matches' : 'No data for this department'}
+              body={search ? 'Try a different search term, or clear the search.' : 'This department has no entries for the selected date.'}
+              actionLabel={search ? 'Clear search' : null}
+              onAction={search ? () => setSearch('') : null}
+            />
+          ) : (
+            <DataTable cols={COLS_AGG} rows={filtered} fmt={fmt} fmtRate={fmtRate} view={view} />
+          )}
+        </div>
+      </main>
+
+      {toast && (
+        <div className="fade-in" style={{
+          position: 'fixed', bottom: 22, right: 22, background: toast.isError ? 'var(--danger)' : 'var(--ink)',
+          color: theme === 'dark' ? 'var(--bg)' : '#fff', padding: '12px 18px', borderRadius: 8, fontSize: 13, maxWidth: 360, zIndex: 50
+        }}>
+          {toast.msg}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   TOP BAR
+============================================================ */
+function TopBar({ theme, setTheme, search, setSearch, onUploadClick, uploading }) {
+  return (
+    <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
+      <div style={{ maxWidth: 1200, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 9, flexShrink: 0 }}>
+          <div style={{ width: 26, height: 26, borderRadius: 6, background: 'var(--accent)', color: 'var(--accent-ink)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13 }}>B</div>
+          <span style={{ fontWeight: 600, fontSize: 15 }}>Batchwise tracker</span>
+        </div>
+
+        <div style={{ flex: 1, maxWidth: 440, position: 'relative' }}>
+          <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--ink-3)', display: 'flex' }}>
+            <IconSearch />
+          </span>
+          <input
+            value={search} onChange={e => setSearch(e.target.value)}
+            placeholder="Search work center, alloy, or batch"
+            className="focus-ring"
+            style={{
+              width: '100%', padding: '9px 12px 9px 36px', borderRadius: 8, border: '1px solid var(--line)',
+              background: 'var(--surface-2)', color: 'var(--ink)'
+            }}
+          />
+        </div>
+
+        <div style={{ flex: 1 }} />
+
+        <button onClick={onUploadClick} disabled={uploading} className="focus-ring" style={{
+          display: 'flex', alignItems: 'center', gap: 7, padding: '9px 14px', borderRadius: 8,
+          border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13,
+          opacity: uploading ? 0.6 : 1
+        }}>
+          {uploading ? <span className="spin" style={{ width: 14, height: 14, border: '2px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} /> : <IconUpload />}
+          {uploading ? 'Uploading…' : 'Upload'}
+        </button>
+
+        <button onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')} className="focus-ring" aria-label="Toggle dark mode"
+          style={{ display: 'flex', padding: 9, borderRadius: 8, border: '1px solid var(--line-strong)', background: 'var(--surface)' }}>
+          {theme === 'dark' ? <IconSun /> : <IconMoon />}
+        </button>
+      </div>
+    </header>
+  );
+}
+
+/* ============================================================
+   FILTER BAR
+============================================================ */
+function FilterBar({ dateIndex, selectedDate, setSelectedDate, department, setDepartment, view, setView, hasBatch }) {
+  return (
+    <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, margin: '4px 0 18px' }}>
+      <select value={selectedDate || ''} onChange={e => setSelectedDate(e.target.value)} className="focus-ring"
+        disabled={!dateIndex.length}
+        style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 500 }}>
+        {dateIndex.length === 0 && <option>No dates yet</option>}
+        {dateIndex.map(d => <option key={d} value={d}>{keyToLabel(d)}</option>)}
+      </select>
+
+      <div style={{ display: 'flex', gap: 6, background: 'var(--surface-2)', border: '1px solid var(--line)', borderRadius: 999, padding: 4, flexWrap: 'wrap' }}>
+        {DEPARTMENTS.map(d => (
+          <button key={d} onClick={() => setDepartment(d)} className="focus-ring" style={{
+            padding: '7px 14px', borderRadius: 999, border: 'none', fontWeight: 600, fontSize: 12.5,
+            background: d === department ? 'var(--accent)' : 'transparent',
+            color: d === department ? 'var(--accent-ink)' : 'var(--ink-2)'
+          }}>{d}</button>
+        ))}
+      </div>
+
+      <div style={{ display: 'flex', gap: 4, background: 'var(--surface-2)', border: '1px solid var(--line)', borderRadius: 8, padding: 3 }}>
+        {[['wc', 'Work center'], ['alloy', 'Alloy'], ['batch', 'Batch']].map(([k, label]) => {
+          const disabled = k === 'batch' && !hasBatch;
+          return (
+            <button key={k} onClick={() => !disabled && setView(k)} disabled={disabled} className="focus-ring" style={{
+              padding: '6px 12px', borderRadius: 6, border: 'none', fontSize: 12.5, fontWeight: 600,
+              background: k === view ? 'var(--surface)' : 'transparent',
+              color: disabled ? 'var(--ink-3)' : (k === view ? 'var(--ink)' : 'var(--ink-2)'),
+              opacity: disabled ? 0.5 : 1, cursor: disabled ? 'not-allowed' : 'pointer'
+            }} title={disabled ? 'No batch numbers in this file' : ''}>{label}</button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   STAT ROW
+============================================================ */
+function StatRow({ qty, total, entries, fmt }) {
+  const cards = [
+    ['Total qty', fmt(qty) + ' kg'],
+    ['Total cost', '\u20B9' + fmt(total)],
+    ['Entries', fmt(entries)]
+  ];
+  return (
+    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10, marginBottom: 16 }}>
+      {cards.map(([label, val]) => (
+        <div key={label} style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '12px 16px' }}>
+          <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>{label}</div>
+          <div style={{ fontSize: 21, fontWeight: 600, marginTop: 2 }}>{val}</div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/* ============================================================
+   DATA TABLE
+============================================================ */
+function DataTable({ cols, rows, fmt, fmtRate, view }) {
+  return (
+    <div style={{ overflowX: 'auto' }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, minWidth: 820 }}>
+        <thead>
+          <tr>
+            {cols.map(([key, label, align]) => (
+              <th key={key} style={{
+                textAlign: align, padding: '10px 14px', fontSize: 12, fontWeight: 600,
+                color: 'var(--ink-2)', borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap',
+                position: 'sticky', top: 0, background: 'var(--surface)'
+              }}>{label}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map((r, i) => (
+            <tr key={r.name + i} style={{ transition: 'background 0.1s' }}
+              onMouseEnter={e => e.currentTarget.style.background = 'var(--surface-2)'}
+              onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
+              {cols.map(([key, , align]) => {
+                const isName = key === 'name';
+                const isMono = isName && view === 'batch';
+                let val;
+                if (key === 'rate') val = fmtRate(r[key]);
+                else if (key === 'name' || key === 'wc') val = r[key];
+                else val = fmt(r[key]);
+                return (
+                  <td key={key} className={isMono ? 'mono' : ''} style={{
+                    padding: '9px 14px', textAlign: align, borderBottom: '1px solid var(--line)',
+                    whiteSpace: 'nowrap', fontWeight: (key === 'total' || key === 'rate') ? 600 : 400
+                  }}>{val}</td>
+                );
+              })}
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+/* ============================================================
+   STATES
+============================================================ */
+function LoadingState() {
+  return (
+    <div style={{ padding: '64px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, color: 'var(--ink-2)' }}>
+      <span className="spin" style={{ width: 22, height: 22, border: '2.5px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} />
+      <span style={{ fontSize: 13 }}>Loading data…</span>
+    </div>
+  );
+}
+function ErrorState({ message, onRetry }) {
+  return (
+    <div style={{ padding: '56px 20px', textAlign: 'center' }}>
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>Something went wrong</div>
+      <div style={{ fontSize: 13, color: 'var(--ink-2)', marginBottom: 16 }}>{message}</div>
+      <button onClick={onRetry} className="focus-ring" style={{ padding: '8px 16px', borderRadius: 8, border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13 }}>
+        Retry
+      </button>
+    </div>
+  );
+}
+function EmptyState({ title, body, actionLabel, onAction }) {
+  return (
+    <div style={{ padding: '56px 20px', textAlign: 'center' }}>
+      <div style={{ fontWeight: 600, marginBottom: 6 }}>{title}</div>
+      <div style={{ fontSize: 13, color: 'var(--ink-2)', marginBottom: actionLabel ? 16 : 0, maxWidth: 340, margin: '0 auto 16px' }}>{body}</div>
+      {actionLabel && (
+        <button onClick={onAction} className="focus-ring" style={{ padding: '8px 16px', borderRadius: 8, border: 'none', background: 'var(--accent)', color: 'var(--accent-ink)', fontWeight: 600, fontSize: 13 }}>
+          {actionLabel}
+        </button>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+
+<script>
+(function() {
+  const src = document.getElementById('app-source').textContent;
+  const compiled = Babel.transform(src, { presets: [['react', { runtime: 'classic' }]] }).code;
+  const script = document.createElement('script');
+  script.textContent = compiled;
+  document.body.appendChild(script);
+})();
+</script>
+</body>
+</html>
