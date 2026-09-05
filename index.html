@@ -587,6 +587,20 @@ function App() {
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
   }, [deptRows]);
 
+  // for the trend charts specifically: the set of alloy lines shown must stay
+  // the same no matter which single date is picked up top, otherwise every
+  // date switch reshuffles which lines appear. This looks across every
+  // uploaded date for the department, not just the currently selected one.
+  const allTimeAlloyOptions = useMemo(() => {
+    if (!allRows) return [];
+    const totals = {};
+    allRows.forEach(r => {
+      if (r.dept !== department || !r.mat) return;
+      totals[r.mat] = (totals[r.mat] || 0) + r.qty;
+    });
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
+  }, [allRows, department]);
+
   useEffect(() => {
     if (view === 'batch' && !hasBatch) setView('wc');
   }, [hasBatch, view]);
@@ -686,7 +700,7 @@ function App() {
           <StatRow qty={totals.qty} total={totals.total} entries={deptRows.length} fmt={fmt} />
         )}
 
-        {!loading && !error && view === 'alloy' && alloyOptions.length > 0 && (
+        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
@@ -695,11 +709,11 @@ function App() {
               <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg over time</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — hover a point for qty too)</span>
             </div>
-            <AlloyTrendChart allRows={allRows} department={department} alloys={alloyOptions} />
+            <AlloyTrendChart allRows={allRows} department={department} alloys={allTimeAlloyOptions} />
           </div>
         )}
 
-        {!loading && !error && view === 'alloy' && alloyOptions.length > 0 && (
+        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
@@ -708,11 +722,11 @@ function App() {
               <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Qty over time</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department})</span>
             </div>
-            <AlloyQtyTrendChart allRows={allRows} department={department} alloys={alloyOptions} />
+            <AlloyQtyTrendChart allRows={allRows} department={department} alloys={allTimeAlloyOptions} />
           </div>
         )}
 
-        {!loading && !error && view === 'alloy' && alloyOptions.length > 0 && (
+        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
@@ -721,7 +735,7 @@ function App() {
               <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg by month</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — hover for qty and total production)</span>
             </div>
-            <MonthlyAlloyTrendChart allRows={allRows} department={department} alloys={alloyOptions} />
+            <MonthlyAlloyTrendChart allRows={allRows} department={department} alloys={allTimeAlloyOptions} />
           </div>
         )}
 
