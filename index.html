@@ -1015,9 +1015,9 @@ function AlloyTrendChart({ allRows, department, alloys }) {
               },
               footer: (items) => {
                 if (!items.length) return '';
-                const dateKey = dates[items[0].dataIndex];
-                const total = totalQtyByDate[dateKey] || 0;
-                return 'Total production: ' + Math.round(total).toLocaleString('en-IN') + ' kg';
+                const item = items[0];
+                const qty = item.dataset.qty ? item.dataset.qty[item.dataIndex] : null;
+                return 'Total production: ' + (qty != null ? Math.round(qty).toLocaleString('en-IN') : '0') + ' kg';
               }
             }
           }
