@@ -596,9 +596,17 @@ function App() {
     const totals = {};
     allRows.forEach(r => {
       if (r.dept !== department || !r.mat) return;
+      // dross / scrap / process scrap are recovered by-product materials,
+      // not primary alloys — they shouldn't show up as their own trend line
+      const nameLower = r.mat.toLowerCase();
+      if (nameLower.includes('dross') || nameLower.includes('scrap')) return;
       totals[r.mat] = (totals[r.mat] || 0) + r.qty;
     });
-    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
+    // cap to the top 10 by quantity — this matches the trend chart's color
+    // palette size (10 colors) so no two lines ever end up the same color,
+    // and it keeps small-volume by-product materials from cluttering the
+    // legend when a department accumulates many material codes over time.
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10);
   }, [allRows, department]);
 
   useEffect(() => {
@@ -707,13 +715,15 @@ function App() {
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
               <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg over time</span>
-              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — hover a point for qty too)</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume — hover a point for qty too)</span>
             </div>
             <AlloyTrendChart allRows={allRows} department={department} alloys={allTimeAlloyOptions} />
           </div>
         )}
 
-       {/* {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
+        {/* "Qty over time" and "Cost per kg by month" charts commented out
+            per request — only "Cost per kg over time" stays visible.
+        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
@@ -737,7 +747,8 @@ function App() {
             </div>
             <MonthlyAlloyTrendChart allRows={allRows} department={department} alloys={allTimeAlloyOptions} />
           </div>
-        )} */}
+        )}
+        */}
 
         <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
           {loading ? (
