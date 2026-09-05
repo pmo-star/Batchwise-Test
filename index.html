@@ -1008,10 +1008,8 @@ function AlloyTrendChart({ allRows, department, alloys }) {
             callbacks: {
               label: (ctx) => {
                 const rate = ctx.parsed.y;
-                const qty = ctx.dataset.qty ? ctx.dataset.qty[ctx.dataIndex] : null;
                 const rateText = rate != null ? rate.toFixed(2) + ' Rs/kg' : 'no data';
-                const qtyText = qty != null ? Math.round(qty).toLocaleString('en-IN') + ' kg' : '-';
-                return ctx.dataset.label + ': ' + rateText + '  (' + qtyText + ')';
+                return ctx.dataset.label + ': ' + rateText;
               },
               footer: (items) => {
                 if (!items.length) return '';
@@ -1163,16 +1161,14 @@ function MonthlyAlloyTrendChart({ allRows, department, alloys }) {
             callbacks: {
               label: (ctx) => {
                 const rate = ctx.parsed.y;
-                const qty = ctx.dataset.qty ? ctx.dataset.qty[ctx.dataIndex] : null;
                 const rateText = rate != null ? rate.toFixed(2) + ' Rs/kg' : 'no data';
-                const qtyText = qty != null ? Math.round(qty).toLocaleString('en-IN') + ' kg' : '-';
-                return ctx.dataset.label + ': ' + rateText + '  (' + qtyText + ')';
+                return ctx.dataset.label + ': ' + rateText;
               },
               footer: (items) => {
                 if (!items.length) return '';
-                const monthKey = months[items[0].dataIndex];
-                const total = totalQtyByMonth[monthKey] || 0;
-                return 'Total production: ' + Math.round(total).toLocaleString('en-IN') + ' kg';
+                const item = items[0];
+                const qty = item.dataset.qty ? item.dataset.qty[item.dataIndex] : null;
+                return 'Total production: ' + (qty != null ? Math.round(qty).toLocaleString('en-IN') : '0') + ' kg';
               }
             }
           }
