@@ -76,12 +76,19 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.24.7/babel.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.2.0/chartjs-plugin-zoom.min.js"></script>
 
 <script type="text/babel-jsx" id="app-source">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
 if (typeof pdfjsLib !== 'undefined') {
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+}
+
+if (typeof Chart !== 'undefined' && typeof ChartZoom !== 'undefined') {
+  Chart.register(ChartZoom);
 }
 
 /* ============================================================
@@ -91,55 +98,113 @@ const GOOGLE_SHEET_API_URL = 'https://script.google.com/macros/s/AKfycbzkfY8LRSr
 
 const GROUP_MAP = {
   ZCCP: 'CCP / Mill', ZMILL: 'CCP / Mill', ZPULV: 'CCP / Mill', ZCH01: 'CCP / Mill',
-  ZCOIN: 'Coin', ZCL01: 'Coil (CL01)', ZCUP: 'Cup', ZCASE: 'Case'
+  ZCOIN: 'Coin', ZCL01: 'Coil', ZCUP: 'Cup', ZCASE: 'Case'
 };
-const DEPARTMENTS = ['CCP / Mill', 'Coin', 'Coil (CL01)', 'Cup', 'Case'];
+const DEPARTMENTS = ['CCP / Mill', 'Coin', 'Coil', 'Cup', 'Case'];
 
 /* ============================================================
    STORAGE (Google Sheet backend, in-memory cache)
+   Batch data is stored as real sheet rows (not one giant JSON
+   blob per date) — a single Sheet cell caps out around 50,000
+   characters, which a few hundred batches can exceed easily.
 ============================================================ */
 const cache = {};
-async function sheetGet(key) {
-  if (Object.prototype.hasOwnProperty.call(cache, key)) return cache[key];
+async function sheetGetMeta(key) {
+  const cacheKey = 'meta:' + key;
+  if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
   const res = await fetch(GOOGLE_SHEET_API_URL + '?key=' + encodeURIComponent(key));
   const json = await res.json();
   const val = json && json.value !== undefined ? json.value : null;
-  cache[key] = val;
+  cache[cacheKey] = val;
   return val;
 }
-async function sheetSet(key, value) {
-  cache[key] = value;
-  await fetch(GOOGLE_SHEET_API_URL, { method: 'POST', body: JSON.stringify({ action: 'set', key, value }) });
+async function sheetSetMeta(key, value) {
+  cache['meta:' + key] = value;
+  // Apps Script Web Apps don't send CORS headers on POST responses, so the
+  // browser blocks reading them even though the write itself succeeds
+  // server-side. no-cors mode fires the request without needing to read
+  // the (unreadable) response — the write still lands correctly.
+  await fetch(GOOGLE_SHEET_API_URL, {
+    method: 'POST',
+    mode: 'no-cors',
+    body: JSON.stringify({ action: 'set', key, value })
+  });
 }
 async function getDateIndex() {
-  const raw = await sheetGet('date-index');
+  const raw = await sheetGetMeta('v3-date-index');
   try { return raw ? JSON.parse(raw) : []; } catch (e) { return []; }
 }
-async function setDateIndex(list) { await sheetSet('date-index', JSON.stringify(list)); }
+async function setDateIndex(list) { await sheetSetMeta('v3-date-index', JSON.stringify(list)); }
+
+async function getAllRowsRemote() {
+  const res = await fetch(GOOGLE_SHEET_API_URL + '?action=getAllRows');
+  const json = await res.json();
+  return (json && json.rows) || [];
+}
+
 async function getDayRows(dateKey) {
-  const raw = await sheetGet('rows:' + dateKey);
-  try { return raw ? JSON.parse(raw) : []; } catch (e) { return []; }
+  const cacheKey = 'rows:' + dateKey;
+  if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
+  const res = await fetch(GOOGLE_SHEET_API_URL + '?action=getRows&date=' + encodeURIComponent(dateKey));
+  const json = await res.json();
+  const rows = (json && json.rows) || [];
+  cache[cacheKey] = rows;
+  return rows;
 }
-async function setDayRows(dateKey, rows) { await sheetSet('rows:' + dateKey, JSON.stringify(rows)); }
+async function setDayRows(dateKey, rows) {
+  cache['rows:' + dateKey] = rows;
+  await fetch(GOOGLE_SHEET_API_URL, {
+    method: 'POST',
+    mode: 'no-cors',
+    body: JSON.stringify({ action: 'setRows', date: dateKey, rows })
+  });
+}
 
 /* ============================================================
    PARSING
 ============================================================ */
+function normalizeHeader(h) {
+  return String(h == null ? '' : h)
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .toLowerCase();
+}
+
 function findCol(headers, exact, contains, exclude) {
-  const lower = headers.map(h => (h || '').toString().toLowerCase().trim());
+  const normalized = headers.map(normalizeHeader);
   if (exact) {
     for (const name of exact) {
-      const idx = lower.indexOf(name.toLowerCase());
+      const target = normalizeHeader(name);
+      const idx = normalized.indexOf(target);
       if (idx !== -1) return idx;
     }
   }
   if (contains) {
-    for (let i = 0; i < lower.length; i++) {
-      const h = lower[i];
-      if (contains.every(k => h.includes(k)) && !(exclude || []).some(k => h.includes(k))) return i;
+    const wanted = contains.map(normalizeHeader);
+    const blocked = (exclude || []).map(normalizeHeader);
+    for (let i = 0; i < normalized.length; i++) {
+      const h = normalized[i];
+      if (wanted.every(k => h.includes(k)) && !blocked.some(k => h.includes(k))) return i;
     }
   }
   return -1;
+}
+
+// Prefer the SAP Amount column because the app aggregates amounts and then
+// calculates Rs/kg as amount / quantity. If an export contains only Rs/kg,
+// the parser can still convert that rate to an amount using qty.
+function findCostColumns(headers, family, type) {
+  const amount = findCol(headers,
+    [family + ' Amount'],
+    [family.toLowerCase(), 'amount']
+  );
+  const rate = findCol(headers,
+    [family + ' Rs/KG', family + ' Rs/Kg', family + ' Rs/kg'],
+    [family.toLowerCase(), 'rs/kg']
+  );
+  return { amount, rate, type };
 }
 
 function dateToKey(val) {
@@ -169,7 +234,15 @@ function keyToLabel(key) {
   return d + ' ' + months[parseInt(m, 10) - 1] + ' ' + y;
 }
 
-function num(v) { const n = parseFloat(v); return isFinite(n) ? n : 0; }
+function num(v) {
+  if (typeof v === 'number') return isFinite(v) ? v : 0;
+  const cleaned = String(v == null ? '' : v)
+    .replace(/,/g, '')
+    .replace(/₹/g, '')
+    .trim();
+  const n = parseFloat(cleaned);
+  return isFinite(n) ? n : 0;
+}
 
 async function extractRowsFromPdf(arrayBuffer) {
   const data = new Uint8Array(arrayBuffer);
@@ -229,18 +302,41 @@ async function parseWorkbook(arrayBuffer, isPdf) {
   const locCol = findCol(headers, ['Storage Location'], ['storage', 'location']);
   const wcCol = findCol(headers, ['Work Center Text'], ['work', 'center'], ['code']);
   const matCol = findCol(headers, ['Material Group'], ['material', 'group']);
+  const matCodeCol = findCol(headers, ['Material Code'], ['material', 'code'], ['description', 'group']);
   const batchCol = findCol(headers, ['Batch']);
   const dateCol = findCol(headers, ['Posting Date'], ['posting', 'date']);
-  const qtyCol = findCol(headers, null, ['qty'], ['unit']);
-  const storeDCol = findCol(headers, ['Store Direct Amount'], ['store', 'direct'], ['rs/kg', 'indirect']);
-  const storeICol = findCol(headers, ['Store Indirect Amount'], ['store', 'indirect'], ['rs/kg']);
-  const powerDCol = findCol(headers, ['Power Direct Amount'], ['power', 'direct'], ['rs/kg', 'indirect']);
-  const powerICol = findCol(headers, ['Power Indirect Amount'], ['power', 'indirect'], ['rs/kg']);
-  const labDCol = findCol(headers, ['Labour Direct Amount'], ['labour', 'direct'], ['rs/kg', 'indirect']);
-  const labICol = findCol(headers, ['Labour Indirect Amount'], ['labour', 'indirect'], ['rs/kg']);
-  const totalCol = findCol(headers, ['Total Amount (Direct + Indirect)', 'Total Amount'], ['total', 'amount'], ['rs/kg', 'direct)', 'indirect)']);
+  const qtyCol = findCol(headers, ['Quantity', 'Qty'], ['qty'], ['unit']);
 
-  if (locCol === -1 || wcCol === -1) throw new Error('Could not find Storage Location / Work Center columns in this file.');
+  // IMPORTANT: these are intentionally resolved as Amount + Rs/KG pairs.
+  // Amount is stored in the backend; the UI derives Rs/KG by dividing by Qty.
+  const storeDCols = findCostColumns(headers, 'Store Direct', 'storeD');
+  const storeICols = findCostColumns(headers, 'Store Indirect', 'storeI');
+  const powerDCols = findCostColumns(headers, 'Power Direct', 'powerD');
+  const powerICols = findCostColumns(headers, 'Power Indirect', 'powerI');
+  const labDCols = findCostColumns(headers, 'Labour Direct', 'labD');
+  const labICols = findCostColumns(headers, 'Labour Indirect', 'labI');
+
+  const totalAmountCol = findCol(headers,
+    ['Total Amount (Direct + Indirect)', 'Total Amount'],
+    ['total', 'amount']
+  );
+  const totalRateCol = findCol(headers,
+    ['Total Rs/KG', 'Total Rs/Kg', 'Total Rs/kg'],
+    ['total', 'rs/kg']
+  );
+
+  if (locCol === -1 || wcCol === -1) {
+    throw new Error('Could not find Storage Location / Work Center columns in this file.');
+  }
+  if (qtyCol === -1) {
+    throw new Error('Could not find Quantity / Qty column in this file.');
+  }
+
+  function costValue(r, cols, qty) {
+    if (cols.amount !== -1) return num(r[cols.amount]);
+    if (cols.rate !== -1) return num(r[cols.rate]) * qty;
+    return 0;
+  }
 
   const byDate = {};
   dataRows.forEach(r => {
@@ -249,39 +345,91 @@ async function parseWorkbook(arrayBuffer, isPdf) {
     const dept = GROUP_MAP[loc] || loc || 'Other';
     const wc = (r[wcCol] || 'Unknown').toString().trim();
     const mat = matCol !== -1 ? (r[matCol] || '').toString().trim() : '';
+    const matCode = matCodeCol !== -1 ? (r[matCodeCol] || '').toString().trim() : '';
     const batch = batchCol !== -1 ? (r[batchCol] || '').toString().trim() : '';
+    const qty = num(r[qtyCol]);
+
     const row = {
-      dept, wc, mat: mat || null, batch: batch || null,
-      qty: qtyCol !== -1 ? num(r[qtyCol]) : 0,
-      storeD: storeDCol !== -1 ? num(r[storeDCol]) : 0,
-      storeI: storeICol !== -1 ? num(r[storeICol]) : 0,
-      labD: labDCol !== -1 ? num(r[labDCol]) : 0,
-      labI: labICol !== -1 ? num(r[labICol]) : 0,
-      powerD: powerDCol !== -1 ? num(r[powerDCol]) : 0,
-      powerI: powerICol !== -1 ? num(r[powerICol]) : 0,
-      total: totalCol !== -1 ? num(r[totalCol]) : 0
+      dept,
+      wc,
+      mat: mat || null,
+      matCode: matCode || null,
+      batch: batch || null,
+      qty,
+      storeD: costValue(r, storeDCols, qty),
+      storeI: costValue(r, storeICols, qty),
+      labD: costValue(r, labDCols, qty),
+      labI: costValue(r, labICols, qty),
+      powerD: costValue(r, powerDCols, qty),
+      powerI: costValue(r, powerICols, qty),
+      total: totalAmountCol !== -1
+        ? num(r[totalAmountCol])
+        : (totalRateCol !== -1 ? num(r[totalRateCol]) * qty : 0)
     };
+
     if (!byDate[dateKey]) byDate[dateKey] = [];
     byDate[dateKey].push(row);
   });
+
   return byDate;
 }
 
 /* ============================================================
    AGGREGATION
 ============================================================ */
-function aggregateBy(rows, keyFn) {
+function aggregateBy(rows, keyFn, nameFn) {
   const buckets = {};
+
   rows.forEach(r => {
     const k = keyFn(r);
     if (!k) return;
-    if (!buckets[k]) buckets[k] = { name: k, count: 0, qty: 0, storeD: 0, storeI: 0, labD: 0, labI: 0, powerD: 0, powerI: 0, total: 0, wc: r.wc };
+
+    if (!buckets[k]) {
+      buckets[k] = {
+        name: nameFn ? nameFn(r) : k,
+        count: 0,
+        qty: 0,
+        storeD: 0,
+        storeI: 0,
+        labD: 0,
+        labI: 0,
+        powerD: 0,
+        powerI: 0,
+        total: 0,
+        wcs: new Set(),
+        mats: new Set(),
+        matCodes: new Set()
+      };
+    }
+
     const b = buckets[k];
     b.count++;
-    ['qty','storeD','storeI','labD','labI','powerD','powerI','total'].forEach(f => b[f] += r[f]);
+
+    ['qty','storeD','storeI','labD','labI','powerD','powerI','total']
+      .forEach(f => b[f] += r[f]);
+
+    if (r.wc) b.wcs.add(r.wc);
+    if (r.mat) b.mats.add(r.mat);
+    if (r.matCode) b.matCodes.add(r.matCode);
   });
+
   return Object.values(buckets)
-    .map(b => ({ ...b, rate: b.qty ? b.total / b.qty : 0 }))
+    .map(b => ({
+      ...b,
+      wc: Array.from(b.wcs).join(', '),
+      material: Array.from(b.mats).join(', '),
+      // Batch view groups by Batch + Material Code, therefore this is
+      // normally exactly one code. Keeping a simple string here avoids
+      // showing misleading multi-code values for one production row.
+      matCode: Array.from(b.matCodes)[0] || '',
+      rate: b.qty ? b.total / b.qty : 0,
+      storeDRate: b.qty ? b.storeD / b.qty : 0,
+      storeIRate: b.qty ? b.storeI / b.qty : 0,
+      labDRate: b.qty ? b.labD / b.qty : 0,
+      labIRate: b.qty ? b.labI / b.qty : 0,
+      powerDRate: b.qty ? b.powerD / b.qty : 0,
+      powerIRate: b.qty ? b.powerI / b.qty : 0
+    }))
     .sort((a, b) => b.qty - a.qty);
 }
 
@@ -325,12 +473,11 @@ function Chip({ label, onRemove }) {
 ============================================================ */
 function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('bwt-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
-  const [dateIndex, setDates] = useState([]);
+  const [allRows, setAllRows] = useState(null); // every row, every date — loaded once
   const [selectedDate, setSelectedDate] = useState(null);
   const [department, setDepartment] = useState('CCP / Mill');
   const [view, setView] = useState('wc');
   const [search, setSearch] = useState('');
-  const [rows, setRows] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -347,14 +494,20 @@ function App() {
     setTimeout(() => setToast(t => (t && t.msg === msg ? null : t)), isError ? 5000 : 3000);
   }, []);
 
-  const loadDates = useCallback(async () => {
+  // dates present in the data, newest first — derived, never a separate
+  // thing that can drift out of sync with what was actually uploaded
+  const dateIndex = useMemo(() => {
+    if (!allRows) return [];
+    return Array.from(new Set(allRows.map(r => r.date))).sort().reverse();
+  }, [allRows]);
+
+  const loadAll = useCallback(async () => {
     setLoading(true); setError(null);
     try {
-      const idx = await getDateIndex();
-      const sorted = idx.slice().sort().reverse();
-      setDates(sorted);
-      setSelectedDate(prev => (prev && sorted.includes(prev)) ? prev : (sorted[0] || null));
-      if (!sorted.length) setRows([]);
+      const rows = await getAllRowsRemote();
+      setAllRows(rows);
+      const dates = Array.from(new Set(rows.map(r => r.date))).sort().reverse();
+      setSelectedDate(prev => (prev && dates.includes(prev)) ? prev : (dates[0] || null));
     } catch (e) {
       setError('Could not reach the data source. Check your connection and try again.');
     } finally {
@@ -362,47 +515,77 @@ function App() {
     }
   }, []);
 
-  useEffect(() => { loadDates(); }, [loadDates]);
+  useEffect(() => { loadAll(); }, [loadAll]);
 
-  useEffect(() => {
-    if (!selectedDate) return;
-    let cancelled = false;
-    setLoading(true); setError(null);
-    getDayRows(selectedDate)
-      .then(r => { if (!cancelled) { setRows(r); setLoading(false); } })
-      .catch(() => { if (!cancelled) { setError('Could not load data for this date.'); setLoading(false); } });
-    return () => { cancelled = true; };
-  }, [selectedDate]);
+  // rows for just the selected date — pure client-side slice, instant
+  const rows = useMemo(() => {
+    if (!allRows || !selectedDate) return allRows === null ? null : [];
+    return allRows.filter(r => r.date === selectedDate);
+  }, [allRows, selectedDate]);
 
-  const handleFile = useCallback(async (file) => {
+  const [uploadProgress, setUploadProgress] = useState(null);
+
+  const handleFiles = useCallback(async (fileList) => {
+    const files = Array.from(fileList);
+    if (!files.length) return;
     setUploading(true);
+    const loadedLabels = [];
+    const failed = [];
+    let updatedRows = allRows ? allRows.slice() : [];
     try {
-      const buf = await file.arrayBuffer();
-      const isPdf = file.name.toLowerCase().endsWith('.pdf');
-      const byDate = await parseWorkbook(buf, isPdf);
-      const dates = Object.keys(byDate);
-      if (!dates.length) throw new Error('No usable rows found in this file.');
-      const idx = await getDateIndex();
-      for (const dk of dates) {
-        const existing = await getDayRows(dk).catch(() => []);
-        const merged = existing.filter(r => true).concat(byDate[dk]);
-        await setDayRows(dk, byDate[dk]);
-        if (!idx.includes(dk)) idx.push(dk);
+      for (let i = 0; i < files.length; i++) {
+        const file = files[i];
+        setUploadProgress({ current: i + 1, total: files.length, name: file.name });
+        try {
+          const buf = await file.arrayBuffer();
+          const isPdf = file.name.toLowerCase().endsWith('.pdf');
+          const byDate = await parseWorkbook(buf, isPdf);
+          const dates = Object.keys(byDate);
+          if (!dates.length) throw new Error('No usable rows found.');
+          for (const dk of dates) {
+            await setDayRows(dk, byDate[dk]);
+            // optimistic client-side update — replace this date's rows
+            // immediately rather than waiting on a fresh full reload
+            updatedRows = updatedRows.filter(r => r.date !== dk)
+              .concat(byDate[dk].map(r => ({ ...r, date: dk })));
+            loadedLabels.push(keyToLabel(dk));
+          }
+        } catch (e) {
+          failed.push(file.name + ': ' + (e.message || 'failed'));
+        }
       }
-      idx.sort().reverse();
-      await setDateIndex(idx);
-      showToast('Loaded ' + dates.map(keyToLabel).join(', '));
-      setSelectedDate(dates.sort().reverse()[0]);
-      await loadDates();
+
+      setAllRows(updatedRows);
+      const newDates = Array.from(new Set(updatedRows.map(r => r.date))).sort().reverse();
+
+      if (loadedLabels.length) {
+        showToast('Loaded ' + loadedLabels.join(', ') + (failed.length ? ' — ' + failed.length + ' file(s) failed' : ''), failed.length > 0 && !loadedLabels.length);
+        setSelectedDate(newDates[0]);
+      }
+      if (failed.length && !loadedLabels.length) {
+        showToast(failed.join(' | '), true);
+      } else if (failed.length) {
+        showToast('Some files failed: ' + failed.join(' | '), true);
+      }
     } catch (e) {
       showToast(e.message || 'Upload failed.', true);
     } finally {
       setUploading(false);
+      setUploadProgress(null);
     }
-  }, [loadDates, showToast]);
+  }, [allRows, showToast]);
 
   const deptRows = useMemo(() => (rows || []).filter(r => r.dept === department), [rows, department]);
   const hasBatch = useMemo(() => deptRows.some(r => r.batch), [deptRows]);
+
+  const alloyOptions = useMemo(() => {
+    const totals = {};
+    deptRows.forEach(r => {
+      if (!r.mat) return;
+      totals[r.mat] = (totals[r.mat] || 0) + r.qty;
+    });
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
+  }, [deptRows]);
 
   useEffect(() => {
     if (view === 'batch' && !hasBatch) setView('wc');
@@ -410,15 +593,36 @@ function App() {
 
   const aggregated = useMemo(() => {
     if (view === 'wc') return aggregateBy(deptRows, r => r.wc);
-    if (view === 'alloy') return aggregateBy(deptRows, r => r.mat || 'Unspecified');
-    if (view === 'batch') return aggregateBy(deptRows, r => r.batch);
+    if (view === 'alloy') return aggregateBy(
+      deptRows,
+      r => (r.mat || 'Unspecified') + '||' + r.wc,
+      r => r.mat || 'Unspecified'
+    );
+    if (view === 'batch') {
+      // IMPORTANT: a batch can contain multiple material codes.
+      // Each Batch + Material Code combination must have its own
+      // quantity/cost aggregation so costs never get mixed.
+      return aggregateBy(
+        deptRows,
+        r => {
+          const batch = r.batch || 'Unknown batch';
+          const materialCode = r.matCode || 'Unknown material code';
+          return batch + '||' + materialCode;
+        },
+        r => r.batch || 'Unknown batch'
+      );
+    }
     return [];
   }, [deptRows, view]);
 
   const filtered = useMemo(() => {
     if (!search.trim()) return aggregated;
     const q = search.trim().toLowerCase();
-    return aggregated.filter(r => r.name.toLowerCase().includes(q) || (r.wc || '').toLowerCase().includes(q));
+    return aggregated.filter(r =>
+      r.name.toLowerCase().includes(q) ||
+      (r.wc || '').toLowerCase().includes(q) ||
+      (r.matCode || '').toLowerCase().includes(q)
+    );
   }, [aggregated, search]);
 
   const totals = useMemo(() => {
@@ -435,16 +639,17 @@ function App() {
 
   const COLS_AGG = [
     ['name', view === 'batch' ? 'Batch' : 'Name', 'left'],
-    ...(view === 'batch' ? [['wc', 'Work center', 'left']] : [['count', 'Entries', 'right']]),
+    ...(view === 'batch' ? [['wc', 'Work center', 'left'], ['matCode', 'Material code', 'left']] : []),
+    ...(view === 'alloy' ? [['wc', 'Machine', 'left']] : []),
+    ...(view === 'wc' ? [['count', 'Entries', 'right']] : []),
     ['qty', 'Qty (kg)', 'right'],
-    ['storeD', 'Store direct', 'right'],
-    ['storeI', 'Store indirect', 'right'],
-    ['labD', 'Labour direct', 'right'],
-    ['labI', 'Labour indirect', 'right'],
-    ['powerD', 'Power direct', 'right'],
-    ['powerI', 'Power indirect', 'right'],
-    ['total', 'Total cost', 'right'],
-    ['rate', 'Rs / kg', 'right']
+    ['storeDRate', 'Store direct (Rs/kg)', 'right'],
+    ['storeIRate', 'Store indirect (Rs/kg)', 'right'],
+    ['labDRate', 'Labour direct (Rs/kg)', 'right'],
+    ['labIRate', 'Labour indirect (Rs/kg)', 'right'],
+    ['powerDRate', 'Power direct (Rs/kg)', 'right'],
+    ['powerIRate', 'Power indirect (Rs/kg)', 'right'],
+    ['rate', 'Total (Rs/kg)', 'right']
   ];
 
   return (
@@ -454,9 +659,10 @@ function App() {
         search={search} setSearch={setSearch}
         onUploadClick={() => fileInputRef.current && fileInputRef.current.click()}
         uploading={uploading}
+        uploadProgress={uploadProgress}
       />
-      <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.pdf" style={{ display: 'none' }}
-        onChange={e => { if (e.target.files[0]) handleFile(e.target.files[0]); e.target.value = ''; }} />
+      <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.pdf" multiple style={{ display: 'none' }}
+        onChange={e => { if (e.target.files.length) handleFiles(e.target.files); e.target.value = ''; }} />
 
       <main style={{ maxWidth: 1200, margin: '0 auto', padding: '20px 24px 64px' }}>
 
@@ -480,11 +686,50 @@ function App() {
           <StatRow qty={totals.qty} total={totals.total} entries={deptRows.length} fmt={fmt} />
         )}
 
+        {!loading && !error && view === 'alloy' && alloyOptions.length > 0 && (
+          <div style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg over time</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — hover a point for qty too)</span>
+            </div>
+            <AlloyTrendChart allRows={allRows} department={department} alloys={alloyOptions} />
+          </div>
+        )}
+
+        {!loading && !error && view === 'alloy' && alloyOptions.length > 0 && (
+          <div style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Qty over time</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department})</span>
+            </div>
+            <AlloyQtyTrendChart allRows={allRows} department={department} alloys={alloyOptions} />
+          </div>
+        )}
+
+        {!loading && !error && view === 'alloy' && alloyOptions.length > 0 && (
+          <div style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg by month</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — hover for qty and total production)</span>
+            </div>
+            <MonthlyAlloyTrendChart allRows={allRows} department={department} alloys={alloyOptions} />
+          </div>
+        )}
+
         <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
           {loading ? (
             <LoadingState />
           ) : error ? (
-            <ErrorState message={error} onRetry={loadDates} />
+            <ErrorState message={error} onRetry={loadAll} />
           ) : !dateIndex.length ? (
             <EmptyState
               title="No data yet"
@@ -520,7 +765,7 @@ function App() {
 /* ============================================================
    TOP BAR
 ============================================================ */
-function TopBar({ theme, setTheme, search, setSearch, onUploadClick, uploading }) {
+function TopBar({ theme, setTheme, search, setSearch, onUploadClick, uploading, uploadProgress }) {
   return (
     <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
       <div style={{ maxWidth: 1200, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16 }}>
@@ -552,13 +797,21 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, uploading }
           opacity: uploading ? 0.6 : 1
         }}>
           {uploading ? <span className="spin" style={{ width: 14, height: 14, border: '2px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} /> : <IconUpload />}
-          {uploading ? 'Uploading…' : 'Upload'}
+          {uploading
+            ? (uploadProgress ? 'Uploading ' + uploadProgress.current + '/' + uploadProgress.total + '…' : 'Uploading…')
+            : 'Upload'}
         </button>
 
         <button onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')} className="focus-ring" aria-label="Toggle dark mode"
           style={{ display: 'flex', padding: 9, borderRadius: 8, border: '1px solid var(--line-strong)', background: 'var(--surface)' }}>
           {theme === 'dark' ? <IconSun /> : <IconMoon />}
         </button>
+      </div>
+      <div style={{
+        maxWidth: 1200, margin: '0 auto', padding: '0 24px 10px',
+        fontSize: 12, color: 'var(--ink-2)', textAlign: 'right'
+      }}>
+        Only upload the <strong>&ldquo;Batch Wise Cost&rdquo;</strong> sheet — work center, alloy, and batch views are generated automatically from it.
       </div>
     </header>
   );
@@ -577,15 +830,10 @@ function FilterBar({ dateIndex, selectedDate, setSelectedDate, department, setDe
         {dateIndex.map(d => <option key={d} value={d}>{keyToLabel(d)}</option>)}
       </select>
 
-      <div style={{ display: 'flex', gap: 6, background: 'var(--surface-2)', border: '1px solid var(--line)', borderRadius: 999, padding: 4, flexWrap: 'wrap' }}>
-        {DEPARTMENTS.map(d => (
-          <button key={d} onClick={() => setDepartment(d)} className="focus-ring" style={{
-            padding: '7px 14px', borderRadius: 999, border: 'none', fontWeight: 600, fontSize: 12.5,
-            background: d === department ? 'var(--accent)' : 'transparent',
-            color: d === department ? 'var(--accent-ink)' : 'var(--ink-2)'
-          }}>{d}</button>
-        ))}
-      </div>
+      <select value={department} onChange={e => setDepartment(e.target.value)} className="focus-ring"
+        style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 600 }}>
+        {DEPARTMENTS.map(d => <option key={d} value={d}>{d}</option>)}
+      </select>
 
       <div style={{ display: 'flex', gap: 4, background: 'var(--surface-2)', border: '1px solid var(--line)', borderRadius: 8, padding: 3 }}>
         {[['wc', 'Work center'], ['alloy', 'Alloy'], ['batch', 'Batch']].map(([k, label]) => {
@@ -610,7 +858,6 @@ function FilterBar({ dateIndex, selectedDate, setSelectedDate, department, setDe
 function StatRow({ qty, total, entries, fmt }) {
   const cards = [
     ['Total qty', fmt(qty) + ' kg'],
-    ['Total cost', '\u20B9' + fmt(total)],
     ['Entries', fmt(entries)]
   ];
   return (
@@ -621,6 +868,398 @@ function StatRow({ qty, total, entries, fmt }) {
           <div style={{ fontSize: 21, fontWeight: 600, marginTop: 2 }}>{val}</div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/* ============================================================
+   MULTI-VALUE CELL (click to expand into chips)
+============================================================ */
+function MultiValueCell({ value }) {
+  const [expanded, setExpanded] = useState(false);
+  if (!value || value === '-' || !value.includes(', ')) {
+    return <span className="mono">{value}</span>;
+  }
+  const parts = value.split(', ');
+  if (!expanded) {
+    return (
+      <span onClick={() => setExpanded(true)} className="mono focus-ring" tabIndex={0}
+        onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(true); } }}
+        role="button" aria-expanded="false" aria-label={'Show all ' + parts.length + ' material codes'}
+        style={{ display: 'inline-flex', alignItems: 'center', gap: 6, cursor: 'pointer' }}>
+        {parts[0]}
+        <span style={{
+          fontSize: 11, fontWeight: 600, color: 'var(--accent)', background: 'var(--accent-soft)',
+          padding: '1px 7px', borderRadius: 999, flexShrink: 0
+        }}>+{parts.length - 1}</span>
+      </span>
+    );
+  }
+  return (
+    <span onClick={() => setExpanded(false)} className="focus-ring" tabIndex={0}
+      onKeyDown={e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setExpanded(false); } }}
+      role="button" aria-expanded="true" aria-label="Collapse material codes"
+      style={{ display: 'inline-flex', flexWrap: 'wrap', gap: 4, cursor: 'pointer', maxWidth: 280 }}>
+      {parts.map((p, i) => (
+        <span key={i} className="mono" style={{
+          fontSize: 12, background: 'var(--surface-2)', padding: '2px 8px', borderRadius: 6, border: '1px solid var(--line)'
+        }}>{p}</span>
+      ))}
+    </span>
+  );
+}
+
+/* ============================================================
+   BATCH COST CHART (Rs/kg per batch, line chart)
+============================================================ */
+function ChartResetButton({ chartRef }) {
+  return (
+    <button onClick={() => chartRef.current && chartRef.current.resetZoom()} className="focus-ring" style={{
+      position: 'absolute', top: 0, right: 0, fontSize: 11, fontWeight: 600, padding: '4px 8px',
+      borderRadius: 6, border: '1px solid var(--line)', background: 'var(--surface-2)', color: 'var(--ink-2)', zIndex: 2
+    }}>Reset zoom</button>
+  );
+}
+
+/* ============================================================
+   ALLOY TREND CHART (Rs/kg for every alloy, across all dates,
+   summed across every machine in the department, one line each)
+============================================================ */
+const TREND_LINE_COLORS = ['#B54E2E', '#2E6FBF', '#1E9E6B', '#D9A400', '#C0568A', '#6B4FBF', '#2AA198', '#C4453A', '#7A8B3F', '#8B5A2B'];
+
+const ZOOM_PAN_OPTIONS = {
+  pan: { enabled: true, mode: 'x', modifierKey: null },
+  zoom: {
+    wheel: { enabled: true, speed: 0.08 },
+    pinch: { enabled: true },
+    drag: { enabled: false },
+    mode: 'x'
+  },
+  limits: { x: { minRange: 2 } }
+};
+
+function buildAlloyTrendData(allRows, department, alloys) {
+  if (!allRows || !alloys.length) return { dates: [], rateDatasets: [], qtyDatasets: [], totalQtyByDate: {} };
+  const dateSet = new Set();
+  const byAlloyDate = {};
+  const totalQtyByDate = {};
+  allRows.forEach(r => {
+    if (r.dept !== department) return;
+    // total production for the date includes every alloy in the department,
+    // not just the ones currently plotted as lines
+    totalQtyByDate[r.date] = (totalQtyByDate[r.date] || 0) + r.qty;
+    if (!alloys.includes(r.mat)) return;
+    dateSet.add(r.date);
+    const key = r.mat + '||' + r.date;
+    if (!byAlloyDate[key]) byAlloyDate[key] = { qty: 0, total: 0 };
+    byAlloyDate[key].qty += r.qty;
+    byAlloyDate[key].total += r.total;
+  });
+  const dates = Array.from(dateSet).sort();
+  const rateDatasets = alloys.map((alloy, i) => ({
+    label: alloy,
+    data: dates.map(d => {
+      const b = byAlloyDate[alloy + '||' + d];
+      return b && b.qty ? b.total / b.qty : null;
+    }),
+    qty: dates.map(d => {
+      const b = byAlloyDate[alloy + '||' + d];
+      return b ? b.qty : null;
+    }),
+    borderColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    backgroundColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    fill: false, tension: 0.3, pointRadius: 4, spanGaps: true
+  }));
+  const qtyDatasets = alloys.map((alloy, i) => ({
+    label: alloy,
+    data: dates.map(d => {
+      const b = byAlloyDate[alloy + '||' + d];
+      return b ? b.qty : null;
+    }),
+    borderColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    backgroundColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    fill: false, tension: 0.3, pointRadius: 4, spanGaps: true
+  }));
+  return { dates, rateDatasets, qtyDatasets, totalQtyByDate };
+}
+
+function AlloyTrendChart({ allRows, department, alloys }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  const { dates, rateDatasets, totalQtyByDate } = useMemo(
+    () => buildAlloyTrendData(allRows, department, alloys),
+    [allRows, department, alloys]
+  );
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'line',
+      data: { labels: dates.map(keyToLabel), datasets: rateDatasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
+          zoom: ZOOM_PAN_OPTIONS,
+          tooltip: {
+            callbacks: {
+              label: (ctx) => {
+                const rate = ctx.parsed.y;
+                const qty = ctx.dataset.qty ? ctx.dataset.qty[ctx.dataIndex] : null;
+                const rateText = rate != null ? rate.toFixed(2) + ' Rs/kg' : 'no data';
+                const qtyText = qty != null ? Math.round(qty).toLocaleString('en-IN') + ' kg' : '-';
+                return ctx.dataset.label + ': ' + rateText + '  (' + qtyText + ')';
+              },
+              footer: (items) => {
+                if (!items.length) return '';
+                const dateKey = dates[items[0].dataIndex];
+                const total = totalQtyByDate[dateKey] || 0;
+                return 'Total production: ' + Math.round(total).toLocaleString('en-IN') + ' kg';
+              }
+            }
+          }
+        },
+        scales: {
+          x: { ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
+          y: { title: { display: true, text: 'Rs / kg' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [dates, rateDatasets, totalQtyByDate]);
+
+  if (!rateDatasets.length) {
+    return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No trend data yet.</div>;
+  }
+
+  return (
+    <div style={{ position: 'relative', height: 280 }}>
+      <ChartResetButton chartRef={chartRef} />
+      <canvas ref={canvasRef} role="img" aria-label="Line chart of Rs per kg cost over time, one line per alloy. Hover a point to see quantity. Scroll to zoom, drag to pan."></canvas>
+    </div>
+  );
+}
+
+/* ============================================================
+   ALLOY QTY TREND CHART (Qty kg for every alloy, across dates)
+============================================================ */
+function AlloyQtyTrendChart({ allRows, department, alloys }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  const { dates, qtyDatasets } = useMemo(
+    () => buildAlloyTrendData(allRows, department, alloys),
+    [allRows, department, alloys]
+  );
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'line',
+      data: { labels: dates.map(keyToLabel), datasets: qtyDatasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
+          zoom: ZOOM_PAN_OPTIONS,
+          tooltip: {
+            callbacks: {
+              label: (ctx) => ctx.dataset.label + ': ' + (ctx.parsed.y != null ? Math.round(ctx.parsed.y).toLocaleString('en-IN') + ' kg' : 'no data')
+            }
+          }
+        },
+        scales: {
+          x: { ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
+          y: { title: { display: true, text: 'Qty (kg)' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [dates, qtyDatasets]);
+
+  if (!qtyDatasets.length) {
+    return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No trend data yet.</div>;
+  }
+
+  return (
+    <div style={{ position: 'relative', height: 280 }}>
+      <ChartResetButton chartRef={chartRef} />
+      <canvas ref={canvasRef} role="img" aria-label="Line chart of quantity in kg over time, one line per alloy. Scroll to zoom, drag to pan."></canvas>
+    </div>
+  );
+}
+
+/* ============================================================
+   MONTHLY ALLOY TREND CHART (Rs/kg for every alloy, grouped by
+   calendar month instead of by individual date)
+============================================================ */
+function monthKeyToLabel(key) {
+  const [y, m] = key.split('-');
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  return months[parseInt(m, 10) - 1] + ' ' + y;
+}
+
+function buildMonthlyAlloyTrendData(allRows, department, alloys) {
+  if (!allRows || !alloys.length) return { months: [], rateDatasets: [], totalQtyByMonth: {} };
+  const monthSet = new Set();
+  const byAlloyMonth = {};
+  const totalQtyByMonth = {};
+  allRows.forEach(r => {
+    if (r.dept !== department) return;
+    const monthKey = r.date.slice(0, 7); // "yyyy-mm"
+    totalQtyByMonth[monthKey] = (totalQtyByMonth[monthKey] || 0) + r.qty;
+    if (!alloys.includes(r.mat)) return;
+    monthSet.add(monthKey);
+    const key = r.mat + '||' + monthKey;
+    if (!byAlloyMonth[key]) byAlloyMonth[key] = { qty: 0, total: 0 };
+    byAlloyMonth[key].qty += r.qty;
+    byAlloyMonth[key].total += r.total;
+  });
+  const months = Array.from(monthSet).sort();
+  const rateDatasets = alloys.map((alloy, i) => ({
+    label: alloy,
+    data: months.map(m => {
+      const b = byAlloyMonth[alloy + '||' + m];
+      return b && b.qty ? b.total / b.qty : null;
+    }),
+    qty: months.map(m => {
+      const b = byAlloyMonth[alloy + '||' + m];
+      return b ? b.qty : null;
+    }),
+    borderColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    backgroundColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
+    fill: false, tension: 0.3, pointRadius: 5, spanGaps: true
+  }));
+  return { months, rateDatasets, totalQtyByMonth };
+}
+
+function MonthlyAlloyTrendChart({ allRows, department, alloys }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  const { months, rateDatasets, totalQtyByMonth } = useMemo(
+    () => buildMonthlyAlloyTrendData(allRows, department, alloys),
+    [allRows, department, alloys]
+  );
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'line',
+      data: { labels: months.map(monthKeyToLabel), datasets: rateDatasets },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: true, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
+          zoom: ZOOM_PAN_OPTIONS,
+          tooltip: {
+            callbacks: {
+              label: (ctx) => {
+                const rate = ctx.parsed.y;
+                const qty = ctx.dataset.qty ? ctx.dataset.qty[ctx.dataIndex] : null;
+                const rateText = rate != null ? rate.toFixed(2) + ' Rs/kg' : 'no data';
+                const qtyText = qty != null ? Math.round(qty).toLocaleString('en-IN') + ' kg' : '-';
+                return ctx.dataset.label + ': ' + rateText + '  (' + qtyText + ')';
+              },
+              footer: (items) => {
+                if (!items.length) return '';
+                const monthKey = months[items[0].dataIndex];
+                const total = totalQtyByMonth[monthKey] || 0;
+                return 'Total production: ' + Math.round(total).toLocaleString('en-IN') + ' kg';
+              }
+            }
+          }
+        },
+        scales: {
+          x: { ticks: { autoSkip: false }, grid: { display: false } },
+          y: { title: { display: true, text: 'Rs / kg' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [months, rateDatasets, totalQtyByMonth]);
+
+  if (!rateDatasets.length) {
+    return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No monthly trend data yet.</div>;
+  }
+  if (months.length < 2) {
+    return (
+      <div>
+        <div style={{ fontSize: 13, color: 'var(--ink-2)', marginBottom: 8 }}>
+          Only one month of data uploaded so far ({monthKeyToLabel(months[0])}) — the trend will build up as more months come in.
+        </div>
+        <div style={{ position: 'relative', height: 240 }}>
+          <ChartResetButton chartRef={chartRef} />
+          <canvas ref={canvasRef} role="img" aria-label="Line chart of Rs per kg cost by month, one line per alloy"></canvas>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ position: 'relative', height: 280 }}>
+      <ChartResetButton chartRef={chartRef} />
+      <canvas ref={canvasRef} role="img" aria-label="Line chart of Rs per kg cost by month, one line per alloy. Hover a point for qty and total production. Scroll to zoom, drag to pan."></canvas>
+    </div>
+  );
+}
+
+function BatchCostChart({ rows, title }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    const labels = rows.map(r => r.name);
+    const data = rows.map(r => r.rate);
+
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'line',
+      data: {
+        labels,
+        datasets: [{
+          label: 'Rs/kg',
+          data,
+          borderColor: '#B54E2E',
+          backgroundColor: 'rgba(181,78,46,0.1)',
+          fill: true,
+          tension: 0.3,
+          pointRadius: rows.length > 30 ? 0 : 3,
+          pointBackgroundColor: '#B54E2E',
+          pointHoverRadius: 5
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { display: false }, zoom: ZOOM_PAN_OPTIONS },
+        scales: {
+          x: { ticks: { autoSkip: rows.length > 25, maxRotation: 45, font: { size: 10 } }, grid: { display: false } },
+          y: { title: { display: true, text: 'Rs / kg' }, grid: { color: '#E7E2D8' } }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [rows]);
+
+  return (
+    <div style={{
+      background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+      padding: '16px 16px 8px', marginBottom: 16
+    }}>
+      <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: 'var(--ink-2)' }}>{title}</div>
+      <div style={{ position: 'relative', height: 240 }}>
+        <ChartResetButton chartRef={chartRef} />
+        <canvas ref={canvasRef} role="img" aria-label={title + ' — line chart. Scroll to zoom, drag to pan.'}></canvas>
+      </div>
     </div>
   );
 }
@@ -651,15 +1290,22 @@ function DataTable({ cols, rows, fmt, fmtRate, view }) {
               {cols.map(([key, , align]) => {
                 const isName = key === 'name';
                 const isMono = isName && view === 'batch';
+                const isRateCol = key === 'rate' || key.endsWith('Rate');
+                const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
                 let val;
-                if (key === 'rate') val = fmtRate(r[key]);
-                else if (key === 'name' || key === 'wc') val = r[key];
+                if (isRateCol) val = fmtRate(r[key]);
+                else if (isTextCol) val = r[key] || '-';
                 else val = fmt(r[key]);
+
+                const isMultiValueCol = key === 'matCode' || key === 'material';
+                const cellContent = isMultiValueCol ? <MultiValueCell value={val} /> : val;
+
                 return (
                   <td key={key} className={isMono ? 'mono' : ''} style={{
                     padding: '9px 14px', textAlign: align, borderBottom: '1px solid var(--line)',
-                    whiteSpace: 'nowrap', fontWeight: (key === 'total' || key === 'rate') ? 600 : 400
-                  }}>{val}</td>
+                    whiteSpace: 'nowrap',
+                    fontWeight: key === 'rate' ? 600 : 400
+                  }}>{cellContent}</td>
                 );
               })}
             </tr>
