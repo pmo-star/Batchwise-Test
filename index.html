@@ -721,8 +721,7 @@ function App() {
           </div>
         )}
 
-        {/* "Qty over time" and "Cost per kg by month" charts commented out
-            per request — only "Cost per kg over time" stays visible.
+        
         {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
@@ -748,7 +747,7 @@ function App() {
             <MonthlyAlloyTrendChart allRows={allRows} department={department} alloys={allTimeAlloyOptions} />
           </div>
         )}
-        */}
+      
 
         <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
           {loading ? (
