@@ -4,6 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Batchwise Tracker</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23B54E2E'/%3E%3Ctext x='16' y='23' font-family='Arial, Helvetica, sans-serif' font-size='19' font-weight='700' fill='white' text-anchor='middle'%3EB%3C/text%3E%3C/svg%3E">
 <style>
   :root {
     --bg: #F7F5F1;
@@ -900,28 +901,126 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, uploading, 
 /* ============================================================
    FILTER BAR
 ============================================================ */
+const MONTH_NAMES_FULL = ['January','February','March','April','May','June','July','August','September','October','November','December'];
+
+function DateRangeCalendarPicker({ dateIndex, fromDate, setFromDate, toDate, setToDate }) {
+  const [openRole, setOpenRole] = useState(null); // 'from' | 'to' | null
+  const [viewYear, setViewYear] = useState(null);
+  const [viewMonth, setViewMonth] = useState(null);
+  const wrapRef = useRef(null);
+  const dateSet = useMemo(() => new Set(dateIndex), [dateIndex]);
+
+  useEffect(() => {
+    function handleOutside(e) {
+      if (wrapRef.current && !wrapRef.current.contains(e.target)) setOpenRole(null);
+    }
+    document.addEventListener('mousedown', handleOutside);
+    return () => document.removeEventListener('mousedown', handleOutside);
+  }, []);
+
+  function openFor(role) {
+    if (!dateIndex.length) return;
+    if (openRole === role) { setOpenRole(null); return; }
+    const current = role === 'from' ? fromDate : toDate;
+    const base = current || dateIndex[0];
+    const [y, m] = base.split('-');
+    setViewYear(parseInt(y, 10));
+    setViewMonth(parseInt(m, 10) - 1);
+    setOpenRole(role);
+  }
+
+  function pick(k) {
+    if (openRole === 'from') setFromDate(k); else setToDate(k);
+    setOpenRole(null);
+  }
+
+  function shiftMonth(delta) {
+    let m = viewMonth + delta, y = viewYear;
+    if (m < 0) { m = 11; y--; }
+    if (m > 11) { m = 0; y++; }
+    setViewMonth(m); setViewYear(y);
+  }
+
+  const fieldStyle = (active) => ({
+    textAlign: 'left', padding: '7px 12px', borderRadius: 8,
+    border: '1px solid ' + (active ? 'var(--accent)' : 'var(--line)'),
+    background: active ? 'var(--surface-2)' : 'var(--surface)', cursor: 'pointer'
+  });
+
+  let dayCells = null;
+  if (openRole && viewYear != null) {
+    const firstDay = new Date(viewYear, viewMonth, 1).getDay();
+    const daysInMonth = new Date(viewYear, viewMonth + 1, 0).getDate();
+    const activeVal = openRole === 'from' ? fromDate : toDate;
+    dayCells = [];
+    for (let i = 0; i < firstDay; i++) dayCells.push(null);
+    for (let d = 1; d <= daysInMonth; d++) {
+      const k = viewYear + '-' + String(viewMonth + 1).padStart(2, '0') + '-' + String(d).padStart(2, '0');
+      dayCells.push({ d, k, has: dateSet.has(k), selected: k === activeVal });
+    }
+  }
+
+  return (
+    <div ref={wrapRef} style={{ position: 'relative' }}>
+      <div style={{ display: 'flex', gap: 8, background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 8, padding: 4 }}>
+        <button type="button" className="focus-ring" disabled={!dateIndex.length} onClick={() => openFor('from')} style={fieldStyle(openRole === 'from')}>
+          <span style={{ fontSize: 11, color: 'var(--ink-3)', display: 'block' }}>From</span>
+          <span style={{ fontSize: 13, fontWeight: 600 }}>{fromDate ? keyToLabel(fromDate) : 'No dates yet'}</span>
+        </button>
+        <button type="button" className="focus-ring" disabled={!dateIndex.length} onClick={() => openFor('to')} style={fieldStyle(openRole === 'to')}>
+          <span style={{ fontSize: 11, color: 'var(--ink-3)', display: 'block' }}>To</span>
+          <span style={{ fontSize: 13, fontWeight: 600 }}>{toDate ? keyToLabel(toDate) : 'No dates yet'}</span>
+        </button>
+      </div>
+
+      {openRole && (
+        <div style={{
+          position: 'absolute', top: 'calc(100% + 6px)', left: 0, width: 260, zIndex: 20,
+          background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+          padding: 12, boxShadow: '0 8px 24px rgba(0,0,0,0.15)'
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
+            <button type="button" onClick={() => shiftMonth(-1)} className="focus-ring" aria-label="Previous month"
+              style={{ width: 26, height: 26, borderRadius: 6, border: '1px solid var(--line)', background: 'var(--surface-2)', cursor: 'pointer' }}>‹</button>
+            <span style={{ fontSize: 13, fontWeight: 600 }}>{MONTH_NAMES_FULL[viewMonth]} {viewYear}</span>
+            <button type="button" onClick={() => shiftMonth(1)} className="focus-ring" aria-label="Next month"
+              style={{ width: 26, height: 26, borderRadius: 6, border: '1px solid var(--line)', background: 'var(--surface-2)', cursor: 'pointer' }}>›</button>
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(7, 1fr)', gap: 3 }}>
+            {['S','M','T','W','T','F','S'].map((d, i) => (
+              <div key={i} style={{ fontSize: 10, color: 'var(--ink-3)', textAlign: 'center', padding: '2px 0' }}>{d}</div>
+            ))}
+            {dayCells.map((cell, i) => cell === null ? <div key={i} /> : (
+              <button key={i} type="button" disabled={!cell.has} onClick={() => pick(cell.k)}
+                style={{
+                  aspectRatio: '1', borderRadius: 6, border: 'none', fontSize: 12, position: 'relative',
+                  cursor: cell.has ? 'pointer' : 'not-allowed',
+                  background: cell.selected ? 'var(--accent)' : 'transparent',
+                  color: cell.selected ? '#fff' : (cell.has ? 'var(--ink)' : 'var(--ink-3)')
+                }}>
+                {cell.d}
+                {cell.has && !cell.selected && (
+                  <span style={{ position: 'absolute', bottom: 2, left: '50%', transform: 'translateX(-50%)', width: 4, height: 4, borderRadius: '50%', background: 'var(--accent)' }} />
+                )}
+              </button>
+            ))}
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 11, color: 'var(--ink-2)', marginTop: 8 }}>
+            <span style={{ width: 7, height: 7, borderRadius: '50%', background: 'var(--accent)', display: 'inline-block' }} />
+            Has data
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
 function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, department, setDepartment, view, setView, hasBatch }) {
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, margin: '4px 0 18px' }}>
-      <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: 'var(--ink-2)' }}>
-        From
-        <select value={fromDate || ''} onChange={e => setFromDate(e.target.value)} className="focus-ring"
-          disabled={!dateIndex.length}
-          style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 500 }}>
-          {dateIndex.length === 0 && <option>No dates yet</option>}
-          {dateIndex.map(d => <option key={d} value={d}>{keyToLabel(d)}</option>)}
-        </select>
-      </label>
-
-      <label style={{ display: 'flex', alignItems: 'center', gap: 6, fontSize: 13, color: 'var(--ink-2)' }}>
-        To
-        <select value={toDate || ''} onChange={e => setToDate(e.target.value)} className="focus-ring"
-          disabled={!dateIndex.length}
-          style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 500 }}>
-          {dateIndex.length === 0 && <option>No dates yet</option>}
-          {dateIndex.map(d => <option key={d} value={d}>{keyToLabel(d)}</option>)}
-        </select>
-      </label>
+      <DateRangeCalendarPicker
+        dateIndex={dateIndex} fromDate={fromDate} setFromDate={setFromDate} toDate={toDate} setToDate={setToDate}
+      />
 
       <select value={department} onChange={e => setDepartment(e.target.value)} className="focus-ring"
         style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 600 }}>
