@@ -415,7 +415,7 @@ function aggregateBy(rows, keyFn, nameFn) {
     ['qty','storeD','storeI','labD','labI','powerD','powerI','total']
       .forEach(f => b[f] += r[f]);
 
-    if (r.wc) { const nk = normKey(r.wc); if (!b.wcs[nk]) b.wcs[nk] = r.wc.trim(); }
+    if (r.wc) { const nk = normKey(r.wc); b.wcs[nk] = nk; }
     if (r.mat) { const nk = normKey(r.mat); if (!b.mats[nk]) b.mats[nk] = r.mat.trim(); }
     if (r.matCode) { const nk = normKey(r.matCode); if (!b.matCodes[nk]) b.matCodes[nk] = r.matCode.trim(); }
   });
@@ -636,14 +636,15 @@ function App() {
   const allTimeMachineOptions = useMemo(() => {
     if (!allRows) return [];
     const totals = {};
-    const display = {};
     allRows.forEach(r => {
       if (r.dept !== department || !r.wc) return;
       const key = normKey(r.wc);
       totals[key] = (totals[key] || 0) + r.qty;
-      if (!display[key]) display[key] = r.wc.trim();
     });
-    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10).map(k => display[k]);
+    // use the normalized (upper-case, single-spaced) form directly as the
+    // display name too, so every machine shows in one consistent format
+    // regardless of how it was spaced/cased in a given SAP export.
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10);
   }, [allRows, department]);
 
   useEffect(() => {
@@ -651,7 +652,7 @@ function App() {
   }, [hasBatch, view]);
 
   const aggregated = useMemo(() => {
-    if (view === 'wc') return aggregateBy(deptRows, r => normKey(r.wc), r => (r.wc || '').trim());
+    if (view === 'wc') return aggregateBy(deptRows, r => normKey(r.wc), r => normKey(r.wc));
     if (view === 'alloy') return aggregateBy(
       deptRows,
       r => normKey(r.mat || 'Unspecified') + '||' + normKey(r.wc),
@@ -697,10 +698,10 @@ function App() {
   const fmtRate = n => n.toFixed(2);
 
   const COLS_AGG = [
-    ['name', view === 'batch' ? 'Batch' : 'Name', 'left'],
+    ['name', view === 'batch' ? 'Batch' : view === 'wc' ? 'Machine' : view === 'alloy' ? 'Material' : 'Name', 'left'],
     ...(view === 'batch' ? [['wc', 'Work center', 'left'], ['matCode', 'Material code', 'left']] : []),
     ...(view === 'alloy' ? [['wc', 'Machine', 'left']] : []),
-    ...(view === 'wc' ? [['count', 'Entries', 'right']] : []),
+    ...(view === 'wc' ? [['count', 'Batch', 'right']] : []),
     ['qty', 'Qty (kg)', 'right'],
     ['storeDRate', 'Store direct (Rs/kg)', 'right'],
     ['storeIRate', 'Store indirect (Rs/kg)', 'right'],
@@ -950,7 +951,7 @@ function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, depart
 function StatRow({ qty, total, entries, fmt }) {
   const cards = [
     ['Total qty', fmt(qty) + ' kg'],
-    ['Entries', fmt(entries)]
+    ['Total Batch', fmt(entries)]
   ];
   return (
     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10, marginBottom: 16 }}>
