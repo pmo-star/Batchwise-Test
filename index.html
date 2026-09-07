@@ -234,6 +234,13 @@ function keyToLabel(key) {
   return d + ' ' + months[parseInt(m, 10) - 1] + ' ' + y;
 }
 
+// groups names that differ only by case or extra whitespace — a common SAP
+// export inconsistency between different days' files — so the same machine
+// or alloy doesn't show up twice under slightly different spellings.
+function normKey(s) {
+  return (s || '').trim().replace(/\s+/g, ' ').toUpperCase();
+}
+
 function num(v) {
   if (typeof v === 'number') return isFinite(v) ? v : 0;
   const cleaned = String(v == null ? '' : v)
@@ -396,9 +403,9 @@ function aggregateBy(rows, keyFn, nameFn) {
         powerD: 0,
         powerI: 0,
         total: 0,
-        wcs: new Set(),
-        mats: new Set(),
-        matCodes: new Set()
+        wcs: {},      // normKey -> first-seen display text, avoids case/space duplicates
+        mats: {},
+        matCodes: {}
       };
     }
 
@@ -408,20 +415,20 @@ function aggregateBy(rows, keyFn, nameFn) {
     ['qty','storeD','storeI','labD','labI','powerD','powerI','total']
       .forEach(f => b[f] += r[f]);
 
-    if (r.wc) b.wcs.add(r.wc);
-    if (r.mat) b.mats.add(r.mat);
-    if (r.matCode) b.matCodes.add(r.matCode);
+    if (r.wc) { const nk = normKey(r.wc); if (!b.wcs[nk]) b.wcs[nk] = r.wc.trim(); }
+    if (r.mat) { const nk = normKey(r.mat); if (!b.mats[nk]) b.mats[nk] = r.mat.trim(); }
+    if (r.matCode) { const nk = normKey(r.matCode); if (!b.matCodes[nk]) b.matCodes[nk] = r.matCode.trim(); }
   });
 
   return Object.values(buckets)
     .map(b => ({
       ...b,
-      wc: Array.from(b.wcs).join(', '),
-      material: Array.from(b.mats).join(', '),
+      wc: Object.values(b.wcs).join(', '),
+      material: Object.values(b.mats).join(', '),
       // Batch view groups by Batch + Material Code, therefore this is
       // normally exactly one code. Keeping a simple string here avoids
       // showing misleading multi-code values for one production row.
-      matCode: Array.from(b.matCodes)[0] || '',
+      matCode: Object.values(b.matCodes)[0] || '',
       rate: b.qty ? b.total / b.qty : 0,
       storeDRate: b.qty ? b.storeD / b.qty : 0,
       storeIRate: b.qty ? b.storeI / b.qty : 0,
@@ -598,22 +605,30 @@ function App() {
   // the same no matter which single date is picked up top, otherwise every
   // date switch reshuffles which lines appear. This looks across every
   // uploaded date for the department, not just the currently selected one.
+  // groups names that differ only by case or extra whitespace (a common SAP
+  // export inconsistency between different days' files) so they don't show
+  // up as separate, duplicate-looking lines in the trend charts.
+  // using shared normKey() defined near keyToLabel
+
   const allTimeAlloyOptions = useMemo(() => {
     if (!allRows) return [];
     const totals = {};
+    const display = {};
     allRows.forEach(r => {
       if (r.dept !== department || !r.mat) return;
       // dross / scrap / process scrap are recovered by-product materials,
       // not primary alloys — they shouldn't show up as their own trend line
       const nameLower = r.mat.toLowerCase();
       if (nameLower.includes('dross') || nameLower.includes('scrap')) return;
-      totals[r.mat] = (totals[r.mat] || 0) + r.qty;
+      const key = normKey(r.mat);
+      totals[key] = (totals[key] || 0) + r.qty;
+      if (!display[key]) display[key] = r.mat.trim();
     });
     // cap to the top 10 by quantity — this matches the trend chart's color
     // palette size (10 colors) so no two lines ever end up the same color,
     // and it keeps small-volume by-product materials from cluttering the
     // legend when a department accumulates many material codes over time.
-    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10);
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10).map(k => display[k]);
   }, [allRows, department]);
 
   // same idea as allTimeAlloyOptions, but grouped by work center (machine)
@@ -621,11 +636,14 @@ function App() {
   const allTimeMachineOptions = useMemo(() => {
     if (!allRows) return [];
     const totals = {};
+    const display = {};
     allRows.forEach(r => {
       if (r.dept !== department || !r.wc) return;
-      totals[r.wc] = (totals[r.wc] || 0) + r.qty;
+      const key = normKey(r.wc);
+      totals[key] = (totals[key] || 0) + r.qty;
+      if (!display[key]) display[key] = r.wc.trim();
     });
-    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10);
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10).map(k => display[k]);
   }, [allRows, department]);
 
   useEffect(() => {
@@ -633,11 +651,11 @@ function App() {
   }, [hasBatch, view]);
 
   const aggregated = useMemo(() => {
-    if (view === 'wc') return aggregateBy(deptRows, r => r.wc);
+    if (view === 'wc') return aggregateBy(deptRows, r => normKey(r.wc), r => (r.wc || '').trim());
     if (view === 'alloy') return aggregateBy(
       deptRows,
-      r => (r.mat || 'Unspecified') + '||' + r.wc,
-      r => r.mat || 'Unspecified'
+      r => normKey(r.mat || 'Unspecified') + '||' + normKey(r.wc),
+      r => (r.mat || 'Unspecified').trim()
     );
     if (view === 'batch') {
       // IMPORTANT: a batch can contain multiple material codes.
@@ -1015,6 +1033,12 @@ const ZOOM_PAN_OPTIONS = {
 function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate) {
   groupField = groupField || 'mat';
   if (!allRows || !groupValues.length) return { dates: [], rateDatasets: [], qtyDatasets: [], totalQtyByDate: {} };
+  // using shared normKey() defined near keyToLabel
+  // map a normalized name back to the canonical display name from groupValues,
+  // so rows whose raw wc/mat differs only by case or extra whitespace still
+  // fold into the same line instead of appearing as a separate duplicate
+  const canonicalByNormKey = {};
+  groupValues.forEach(v => { canonicalByNormKey[normKey(v)] = v; });
   const dateSet = new Set();
   const byGroupDate = {};
   const totalQtyByDate = {};
@@ -1025,10 +1049,10 @@ function buildAlloyTrendData(allRows, department, groupValues, groupField, fromD
     // total production for the date includes every group value in the
     // department, not just the ones currently plotted as lines
     totalQtyByDate[r.date] = (totalQtyByDate[r.date] || 0) + r.qty;
-    const groupVal = r[groupField];
-    if (!groupValues.includes(groupVal)) return;
+    const canonical = canonicalByNormKey[normKey(r[groupField])];
+    if (!canonical) return;
     dateSet.add(r.date);
-    const key = groupVal + '||' + r.date;
+    const key = canonical + '||' + r.date;
     if (!byGroupDate[key]) byGroupDate[key] = { qty: 0, total: 0 };
     byGroupDate[key].qty += r.qty;
     byGroupDate[key].total += r.total;
