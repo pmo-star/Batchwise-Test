@@ -611,11 +611,25 @@ function App() {
   // up as separate, duplicate-looking lines in the trend charts.
   // using shared normKey() defined near keyToLabel
 
+  // the search box should narrow the trend charts too, not just the table —
+  // otherwise typing "MILLING" filters the table but the charts above keep
+  // showing every alloy/machine, which looks like the search did nothing.
+  const searchedAllRows = useMemo(() => {
+    if (!allRows) return allRows;
+    if (!search.trim()) return allRows;
+    const q = search.trim().toLowerCase();
+    return allRows.filter(r =>
+      (r.mat || '').toLowerCase().includes(q) ||
+      (r.wc || '').toLowerCase().includes(q) ||
+      (r.matCode || '').toLowerCase().includes(q)
+    );
+  }, [allRows, search]);
+
   const allTimeAlloyOptions = useMemo(() => {
-    if (!allRows) return [];
+    if (!searchedAllRows) return [];
     const totals = {};
     const display = {};
-    allRows.forEach(r => {
+    searchedAllRows.forEach(r => {
       if (r.dept !== department || !r.mat) return;
       // dross / scrap / process scrap are recovered by-product materials,
       // not primary alloys — they shouldn't show up as their own trend line
@@ -630,14 +644,14 @@ function App() {
     // and it keeps small-volume by-product materials from cluttering the
     // legend when a department accumulates many material codes over time.
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10).map(k => display[k]);
-  }, [allRows, department]);
+  }, [searchedAllRows, department]);
 
   // same idea as allTimeAlloyOptions, but grouped by work center (machine)
   // instead of material — for the "by machine" trend chart.
   const allTimeMachineOptions = useMemo(() => {
-    if (!allRows) return [];
+    if (!searchedAllRows) return [];
     const totals = {};
-    allRows.forEach(r => {
+    searchedAllRows.forEach(r => {
       if (r.dept !== department || !r.wc) return;
       const key = normKey(r.wc);
       totals[key] = (totals[key] || 0) + r.qty;
@@ -646,7 +660,7 @@ function App() {
     // display name too, so every machine shows in one consistent format
     // regardless of how it was spaced/cased in a given SAP export.
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10);
-  }, [allRows, department]);
+  }, [searchedAllRows, department]);
 
   useEffect(() => {
     if (view === 'batch' && !hasBatch) setView('wc');
@@ -688,9 +702,29 @@ function App() {
 
   const totals = useMemo(() => {
     return deptRows.reduce((acc, r) => {
-      acc.qty += r.qty; acc.total += r.total; return acc;
-    }, { qty: 0, total: 0 });
+      acc.qty += r.qty; acc.total += r.total;
+      acc.storeD += r.storeD; acc.storeI += r.storeI;
+      acc.labD += r.labD; acc.labI += r.labI;
+      acc.powerD += r.powerD; acc.powerI += r.powerI;
+      return acc;
+    }, { qty: 0, total: 0, storeD: 0, storeI: 0, labD: 0, labI: 0, powerD: 0, powerI: 0 });
   }, [deptRows]);
+
+  // department comparison — every department, for the current date range,
+  // regardless of which one is currently selected in the dropdown above
+  const deptComparison = useMemo(() => {
+    if (!rows) return [];
+    const byDept = {};
+    rows.forEach(r => {
+      if (!byDept[r.dept]) byDept[r.dept] = { dept: r.dept, qty: 0, total: 0 };
+      byDept[r.dept].qty += r.qty;
+      byDept[r.dept].total += r.total;
+    });
+    return DEPARTMENTS.map(d => {
+      const b = byDept[d];
+      return { dept: d, qty: b ? b.qty : 0, rate: b && b.qty ? b.total / b.qty : 0 };
+    });
+  }, [rows]);
 
   const activeFilters = [];
   if (search.trim()) activeFilters.push({ key: 'search', label: 'Search: "' + search.trim() + '"', clear: () => setSearch('') });
@@ -747,6 +781,23 @@ function App() {
           <StatRow qty={totals.qty} total={totals.total} entries={deptRows.length} fmt={fmt} />
         )}
 
+        {!loading && !error && rows && rows.length > 0 && (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 16, marginBottom: 16 }}>
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, padding: '16px 16px 8px' }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 8 }}>
+                Cost breakdown <span style={{ fontWeight: 400, color: 'var(--ink-3)' }}>({department}, this selection)</span>
+              </div>
+              <CostBreakdownChart totals={totals} />
+            </div>
+            <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, padding: '16px 16px 8px' }}>
+              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 8 }}>
+                Department comparison <span style={{ fontWeight: 400, color: 'var(--ink-3)' }}>(all departments, this date range)</span>
+              </div>
+              <DepartmentComparisonChart data={deptComparison} currentDept={department} />
+            </div>
+          </div>
+        )}
+
         {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
@@ -756,7 +807,7 @@ function App() {
               <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg over time — by alloy</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume — hover a point for qty too)</span>
             </div>
-            <AlloyTrendChart allRows={allRows} department={department} alloys={allTimeAlloyOptions}
+            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
               groupField="mat" fromDate={fromDate} toDate={toDate}
               ariaLabel="Line chart of Rs per kg cost over time, one line per alloy. Hover a point to see quantity." />
           </div>
@@ -771,7 +822,7 @@ function App() {
               <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg over time — by machine</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all alloys combined per machine, {department} — top 10 machines by volume — hover a point for qty too)</span>
             </div>
-            <AlloyTrendChart allRows={allRows} department={department} alloys={allTimeMachineOptions}
+            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
               groupField="wc" fromDate={fromDate} toDate={toDate}
               ariaLabel="Line chart of Rs per kg cost over time, one line per machine. Hover a point to see quantity." />
           </div>
@@ -1409,6 +1460,116 @@ function MonthlyAlloyTrendChart({ allRows, department, alloys }) {
   );
 }
 
+/* ============================================================
+   COST BREAKDOWN CHART (Store vs Power vs Labour, Rs/kg,
+   for the current department + selected date range)
+============================================================ */
+function CostBreakdownChart({ totals }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  const rate = (v) => totals.qty ? v / totals.qty : 0;
+  const categories = useMemo(() => ([
+    { label: 'Store', value: rate(totals.storeD + totals.storeI) },
+    { label: 'Power', value: rate(totals.powerD + totals.powerI) },
+    { label: 'Labour', value: rate(totals.labD + totals.labI) }
+  ]), [totals]);
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'bar',
+      data: {
+        labels: categories.map(c => c.label),
+        datasets: [{
+          data: categories.map(c => c.value),
+          backgroundColor: [TREND_LINE_COLORS[1], TREND_LINE_COLORS[3], TREND_LINE_COLORS[0]],
+          borderRadius: 6,
+          barThickness: 28
+        }]
+      },
+      options: {
+        indexAxis: 'y',
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: { callbacks: { label: ctx => ctx.parsed.x.toFixed(3) + ' Rs/kg' } }
+        },
+        scales: {
+          x: { title: { display: true, text: 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } },
+          y: { grid: { display: false } }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [categories]);
+
+  const grandTotal = categories.reduce((s, c) => s + c.value, 0);
+
+  return (
+    <div style={{ position: 'relative', height: 150 }}>
+      <canvas ref={canvasRef} role="img" aria-label="Bar chart of cost breakdown by Store, Power and Labour, in Rs per kg"></canvas>
+      {grandTotal === 0 && (
+        <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, color: 'var(--ink-3)' }}>
+          No cost data for this selection
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ============================================================
+   DEPARTMENT COMPARISON CHART (Rs/kg, every department, for the
+   currently selected date range — regardless of which department
+   is picked in the dropdown above)
+============================================================ */
+function DepartmentComparisonChart({ data, currentDept }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'bar',
+      data: {
+        labels: data.map(d => d.dept),
+        datasets: [{
+          data: data.map(d => d.rate),
+          backgroundColor: data.map(d => d.dept === currentDept ? '#B54E2E' : '#D8D2C4'),
+          borderRadius: 6,
+          barThickness: 36
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: ctx => ctx.parsed.y.toFixed(3) + ' Rs/kg',
+              afterLabel: ctx => Math.round(data[ctx.dataIndex].qty).toLocaleString('en-IN') + ' kg produced'
+            }
+          }
+        },
+        scales: {
+          y: { title: { display: true, text: 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } },
+          x: { grid: { display: false } }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [data, currentDept]);
+
+  return (
+    <div style={{ position: 'relative', height: 220 }}>
+      <canvas ref={canvasRef} role="img" aria-label="Bar chart comparing Rs per kg cost across every department. Currently selected department is highlighted."></canvas>
+    </div>
+  );
+}
+
 function BatchCostChart({ rows, title }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
@@ -1471,11 +1632,12 @@ function DataTable({ cols, rows, fmt, fmtRate, view }) {
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, minWidth: 820 }}>
         <thead>
           <tr>
-            {cols.map(([key, label, align]) => (
+            {cols.map(([key, label, align], colIdx) => (
               <th key={key} style={{
                 textAlign: align, padding: '10px 14px', fontSize: 12, fontWeight: 600,
                 color: 'var(--ink-2)', borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap',
-                position: 'sticky', top: 0, background: 'var(--surface)'
+                position: 'sticky', top: 0, background: 'var(--surface)',
+                ...(colIdx === 0 ? { left: 0, zIndex: 3, boxShadow: '2px 0 4px -2px rgba(0,0,0,0.08)' } : { zIndex: 2 })
               }}>{label}</th>
             ))}
           </tr>
@@ -1485,7 +1647,7 @@ function DataTable({ cols, rows, fmt, fmtRate, view }) {
             <tr key={r.name + i} style={{ transition: 'background 0.1s' }}
               onMouseEnter={e => e.currentTarget.style.background = 'var(--surface-2)'}
               onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-              {cols.map(([key, , align]) => {
+              {cols.map(([key, , align], colIdx) => {
                 const isName = key === 'name';
                 const isMono = isName && view === 'batch';
                 const isRateCol = key === 'rate' || key.endsWith('Rate');
@@ -1502,7 +1664,11 @@ function DataTable({ cols, rows, fmt, fmtRate, view }) {
                   <td key={key} className={isMono ? 'mono' : ''} style={{
                     padding: '9px 14px', textAlign: align, borderBottom: '1px solid var(--line)',
                     whiteSpace: 'nowrap',
-                    fontWeight: key === 'rate' ? 600 : 400
+                    fontWeight: key === 'rate' ? 600 : 400,
+                    ...(colIdx === 0 ? {
+                      position: 'sticky', left: 0, zIndex: 1, background: 'var(--surface)',
+                      boxShadow: '2px 0 4px -2px rgba(0,0,0,0.08)'
+                    } : {})
                   }}>{cellContent}</td>
                 );
               })}
