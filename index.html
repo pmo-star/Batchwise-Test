@@ -1766,6 +1766,7 @@ function BatchCostChart({ rows, title }) {
    DATA TABLE
 ============================================================ */
 function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort }) {
+  const lastIdx = cols.length - 1;
   return (
     <div style={{ overflowX: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, minWidth: 820 }}>
@@ -1773,13 +1774,16 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort })
           <tr>
             {cols.map(([key, label, align], colIdx) => {
               const isActive = sortKey === key;
+              const isLast = colIdx === lastIdx;
               return (
                 <th key={key} onClick={() => onSort && onSort(key)} style={{
                   textAlign: align, padding: '10px 14px', fontSize: 12, fontWeight: 600,
                   color: isActive ? 'var(--accent)' : 'var(--ink-2)', borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap',
                   position: 'sticky', top: 0, background: 'var(--surface)',
                   cursor: onSort ? 'pointer' : 'default', userSelect: 'none',
-                  ...(colIdx === 0 ? { left: 0, zIndex: 3, boxShadow: '2px 0 4px -2px rgba(0,0,0,0.08)' } : { zIndex: 2 })
+                  ...(colIdx === 0 ? { left: 0, zIndex: 3, boxShadow: '2px 0 4px -2px rgba(0,0,0,0.08)' } : {}),
+                  ...(isLast ? { right: 0, zIndex: 3, boxShadow: '-2px 0 4px -2px rgba(0,0,0,0.08)' } : {}),
+                  ...(colIdx !== 0 && !isLast ? { zIndex: 2 } : {})
                 }}>
                   {label}{isActive ? (sortDir === 'asc' ? ' \u2191' : ' \u2193') : ''}
                 </th>
@@ -1797,6 +1801,7 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort })
                 const isMono = isName && view === 'batch';
                 const isRateCol = key === 'rate' || key.endsWith('Rate');
                 const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
+                const isLast = colIdx === lastIdx;
                 let val;
                 if (isRateCol) val = fmtRate(r[key]);
                 else if (isTextCol) val = r[key] || '-';
@@ -1813,6 +1818,10 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort })
                     ...(colIdx === 0 ? {
                       position: 'sticky', left: 0, zIndex: 1, background: 'var(--surface)',
                       boxShadow: '2px 0 4px -2px rgba(0,0,0,0.08)'
+                    } : {}),
+                    ...(isLast ? {
+                      position: 'sticky', right: 0, zIndex: 1, background: 'var(--surface)',
+                      boxShadow: '-2px 0 4px -2px rgba(0,0,0,0.08)'
                     } : {})
                   }}>{cellContent}</td>
                 );
