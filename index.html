@@ -781,22 +781,6 @@ function App() {
     }, { qty: 0, total: 0, storeD: 0, storeI: 0, labD: 0, labI: 0, powerD: 0, powerI: 0, count: 0 });
   }, [filtered]);
 
-  // department comparison — every department, for the current date range,
-  // regardless of which one is currently selected in the dropdown above
-  const deptComparison = useMemo(() => {
-    if (!rows) return [];
-    const byDept = {};
-    rows.forEach(r => {
-      if (!byDept[r.dept]) byDept[r.dept] = { dept: r.dept, qty: 0, total: 0 };
-      byDept[r.dept].qty += r.qty;
-      byDept[r.dept].total += r.total;
-    });
-    return DEPARTMENTS.map(d => {
-      const b = byDept[d];
-      return { dept: d, qty: b ? b.qty : 0, rate: b && b.qty ? b.total / b.qty : 0 };
-    });
-  }, [rows]);
-
   const activeFilters = [];
   if (search.trim()) activeFilters.push({ key: 'search', label: 'Search: "' + search.trim() + '"', clear: () => setSearch('') });
 
@@ -854,17 +838,6 @@ function App() {
           <StatRow qty={totals.qty} total={totals.total} entries={totals.count} fmt={fmt} />
         )}
 
-        {!loading && !error && rows && rows.length > 0 && (
-          <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, padding: '16px 16px 8px', marginBottom: 16 }}>
-            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 8 }}>
-              Department comparison <span style={{ fontWeight: 400, color: 'var(--ink-3)' }}>(all departments, this date range)</span>
-            </div>
-            <div style={{ maxWidth: 600, margin: '0 auto' }}>
-              <DepartmentComparisonChart data={deptComparison} currentDept={department} />
-            </div>
-          </div>
-        )}
-
         {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
@@ -880,7 +853,7 @@ function App() {
           </div>
         )}
 
-        {!loading && !error && view === 'alloy' && allTimeMachineOptions.length > 0 && (
+        {!loading && !error && view === 'wc' && allTimeMachineOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
@@ -945,7 +918,7 @@ function App() {
             />
           ) : (
             <DataTable cols={COLS_AGG} rows={sortedFiltered} fmt={fmt} fmtRate={fmtRate} view={view}
-              sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
+              sortKey={sortKey} sortDir={sortDir} onSort={handleSort} onNameClick={setSearch} />
           )}
         </div>
       </main>
@@ -1546,57 +1519,6 @@ function MonthlyAlloyTrendChart({ allRows, department, alloys }) {
   );
 }
 
-/* ============================================================
-   DEPARTMENT COMPARISON CHART (Rs/kg, every department, for the
-   currently selected date range — regardless of which department
-   is picked in the dropdown above)
-============================================================ */
-function DepartmentComparisonChart({ data, currentDept }) {
-  const canvasRef = useRef(null);
-  const chartRef = useRef(null);
-
-  useEffect(() => {
-    if (!canvasRef.current || typeof Chart === 'undefined') return;
-    if (chartRef.current) chartRef.current.destroy();
-    chartRef.current = new Chart(canvasRef.current, {
-      type: 'bar',
-      data: {
-        labels: data.map(d => d.dept),
-        datasets: [{
-          data: data.map(d => d.rate),
-          backgroundColor: data.map(d => d.dept === currentDept ? '#B54E2E' : '#D8D2C4'),
-          borderRadius: 6,
-          barThickness: 36
-        }]
-      },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: { display: false },
-          tooltip: {
-            callbacks: {
-              label: ctx => ctx.parsed.y.toFixed(3) + ' Rs/kg',
-              afterLabel: ctx => Math.round(data[ctx.dataIndex].qty).toLocaleString('en-IN') + ' kg produced'
-            }
-          }
-        },
-        scales: {
-          y: { title: { display: true, text: 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } },
-          x: { grid: { display: false } }
-        }
-      }
-    });
-    return () => { if (chartRef.current) chartRef.current.destroy(); };
-  }, [data, currentDept]);
-
-  return (
-    <div style={{ position: 'relative', height: 220 }}>
-      <canvas ref={canvasRef} role="img" aria-label="Bar chart comparing Rs per kg cost across every department. Currently selected department is highlighted."></canvas>
-    </div>
-  );
-}
-
 function BatchCostChart({ rows, title }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
@@ -1653,7 +1575,7 @@ function BatchCostChart({ rows, title }) {
 /* ============================================================
    DATA TABLE
 ============================================================ */
-function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort }) {
+function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, onNameClick }) {
   return (
     <div style={{ overflowX: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
@@ -1690,7 +1612,22 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort })
                 else val = fmt(r[key]);
 
                 const isMultiValueCol = key === 'matCode' || key === 'material';
-                const cellContent = isMultiValueCol ? <MultiValueCell value={val} /> : val;
+                const cellContent = isMultiValueCol
+                  ? <MultiValueCell value={val} />
+                  : isName
+                    ? (
+                        <span
+                          onClick={() => onNameClick && onNameClick(r.name)}
+                          className="focus-ring"
+                          title={'Click to filter everything to ' + r.name}
+                          style={{ cursor: onNameClick ? 'pointer' : 'default', color: onNameClick ? 'var(--accent)' : 'inherit', textDecoration: 'none' }}
+                          onMouseEnter={e => { if (onNameClick) e.currentTarget.style.textDecoration = 'underline'; }}
+                          onMouseLeave={e => { e.currentTarget.style.textDecoration = 'none'; }}
+                        >
+                          {val}
+                        </span>
+                      )
+                    : val;
 
                 return (
                   <td key={key} className={isMono ? 'mono' : ''} style={{
