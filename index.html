@@ -863,7 +863,7 @@ function App() {
       <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.pdf" multiple style={{ display: 'none' }}
         onChange={e => { if (e.target.files.length) handleFiles(e.target.files); e.target.value = ''; }} />
 
-      <main style={{ maxWidth: 1200, margin: '0 auto', padding: '20px 24px 64px' }}>
+      <main style={{ maxWidth: 1440, margin: '0 auto', padding: '20px 24px 64px' }}>
 
         <FilterBar
           dateIndex={dateIndex} fromDate={fromDate} setFromDate={setFromDate} toDate={toDate} setToDate={setToDate}
@@ -1021,7 +1021,7 @@ function App() {
 function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress }) {
   return (
     <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
-      <div className="topbar-row" style={{ maxWidth: 1200, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+      <div className="topbar-row" style={{ maxWidth: 1440, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, flexShrink: 0 }}>
           <div style={{ width: 26, height: 26, borderRadius: 6, background: 'var(--accent)', color: 'var(--accent-ink)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13, flexShrink: 0 }}>B</div>
           <span className="topbar-brand-text" style={{ fontWeight: 600, fontSize: 15, whiteSpace: 'nowrap' }}>Batchwise tracker</span>
@@ -1072,7 +1072,7 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
         </div>
       </div>
       <div style={{
-        maxWidth: 1200, margin: '0 auto', padding: '0 24px 10px',
+        maxWidth: 1440, margin: '0 auto', padding: '0 24px 10px',
         fontSize: 12, color: 'var(--ink-2)', textAlign: 'right'
       }}>
         Only upload the <strong>&ldquo;Batch Wise Cost&rdquo;</strong> sheet — work center, alloy, and batch views are generated automatically from it.
@@ -1766,24 +1766,19 @@ function BatchCostChart({ rows, title }) {
    DATA TABLE
 ============================================================ */
 function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort }) {
-  const lastIdx = cols.length - 1;
   return (
     <div style={{ overflowX: 'auto' }}>
-      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, minWidth: 820 }}>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
         <thead>
           <tr>
-            {cols.map(([key, label, align], colIdx) => {
+            {cols.map(([key, label, align]) => {
               const isActive = sortKey === key;
-              const isLast = colIdx === lastIdx;
               return (
                 <th key={key} onClick={() => onSort && onSort(key)} style={{
                   textAlign: align, padding: '10px 14px', fontSize: 12, fontWeight: 600,
                   color: isActive ? 'var(--accent)' : 'var(--ink-2)', borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap',
-                  position: 'sticky', top: 0, background: 'var(--surface)',
-                  cursor: onSort ? 'pointer' : 'default', userSelect: 'none',
-                  ...(colIdx === 0 ? { left: 0, zIndex: 3, boxShadow: '2px 0 4px -2px rgba(0,0,0,0.08)' } : {}),
-                  ...(isLast ? { right: 0, zIndex: 3, boxShadow: '-2px 0 4px -2px rgba(0,0,0,0.08)' } : {}),
-                  ...(colIdx !== 0 && !isLast ? { zIndex: 2 } : {})
+                  position: 'sticky', top: 0, background: 'var(--surface)', zIndex: 2,
+                  cursor: onSort ? 'pointer' : 'default', userSelect: 'none'
                 }}>
                   {label}{isActive ? (sortDir === 'asc' ? ' \u2191' : ' \u2193') : ''}
                 </th>
@@ -1796,12 +1791,11 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort })
             <tr key={r.name + i} style={{ transition: 'background 0.1s' }}
               onMouseEnter={e => e.currentTarget.style.background = 'var(--surface-2)'}
               onMouseLeave={e => e.currentTarget.style.background = 'transparent'}>
-              {cols.map(([key, , align], colIdx) => {
+              {cols.map(([key, , align]) => {
                 const isName = key === 'name';
                 const isMono = isName && view === 'batch';
                 const isRateCol = key === 'rate' || key.endsWith('Rate');
                 const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
-                const isLast = colIdx === lastIdx;
                 let val;
                 if (isRateCol) val = fmtRate(r[key]);
                 else if (isTextCol) val = r[key] || '-';
@@ -1814,15 +1808,7 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort })
                   <td key={key} className={isMono ? 'mono' : ''} style={{
                     padding: '9px 14px', textAlign: align, borderBottom: '1px solid var(--line)',
                     whiteSpace: 'nowrap',
-                    fontWeight: key === 'rate' ? 600 : 400,
-                    ...(colIdx === 0 ? {
-                      position: 'sticky', left: 0, zIndex: 1, background: 'var(--surface)',
-                      boxShadow: '2px 0 4px -2px rgba(0,0,0,0.08)'
-                    } : {}),
-                    ...(isLast ? {
-                      position: 'sticky', right: 0, zIndex: 1, background: 'var(--surface)',
-                      boxShadow: '-2px 0 4px -2px rgba(0,0,0,0.08)'
-                    } : {})
+                    fontWeight: key === 'rate' ? 600 : 400
                   }}>{cellContent}</td>
                 );
               })}
