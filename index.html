@@ -797,37 +797,6 @@ function App() {
     });
   }, [rows]);
 
-  // compares the currently selected date range against the same number of
-  // immediately-preceding uploaded dates for this department, so a plant
-  // head sees a warning the moment cost per kg moves a lot, without having
-  // to remember last period's numbers themselves.
-  const ALERT_THRESHOLD_PCT = 15;
-  const periodComparison = useMemo(() => {
-    if (!allRows || !fromDate || !toDate) return null;
-    const deptAllDates = Array.from(new Set(allRows.filter(r => r.dept === department).map(r => r.date))).sort();
-    const lo = fromDate <= toDate ? fromDate : toDate;
-    const hi = fromDate <= toDate ? toDate : fromDate;
-    const currentDates = deptAllDates.filter(d => d >= lo && d <= hi);
-    if (!currentDates.length) return null;
-    const priorDates = deptAllDates.filter(d => d < lo).slice(-currentDates.length);
-    if (!priorDates.length) return null;
-
-    function rateFor(dateList) {
-      const set = new Set(dateList);
-      let qty = 0, total = 0;
-      allRows.forEach(r => {
-        if (r.dept === department && set.has(r.date)) { qty += r.qty; total += r.total; }
-      });
-      return qty ? total / qty : 0;
-    }
-
-    const currentRate = rateFor(currentDates);
-    const priorRate = rateFor(priorDates);
-    if (!priorRate) return null;
-    const pctChange = ((currentRate - priorRate) / priorRate) * 100;
-    return { currentRate, priorRate, pctChange, currentCount: currentDates.length, priorCount: priorDates.length };
-  }, [allRows, department, fromDate, toDate]);
-
   const activeFilters = [];
   if (search.trim()) activeFilters.push({ key: 'search', label: 'Search: "' + search.trim() + '"', clear: () => setSearch('') });
 
@@ -863,7 +832,7 @@ function App() {
       <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.pdf" multiple style={{ display: 'none' }}
         onChange={e => { if (e.target.files.length) handleFiles(e.target.files); e.target.value = ''; }} />
 
-      <main style={{ maxWidth: 1440, margin: '0 auto', padding: '20px 24px 64px' }}>
+      <main style={{ maxWidth: 1650, margin: '0 auto', padding: '20px 24px 64px' }}>
 
         <FilterBar
           dateIndex={dateIndex} fromDate={fromDate} setFromDate={setFromDate} toDate={toDate} setToDate={setToDate}
@@ -881,38 +850,16 @@ function App() {
           </div>
         )}
 
-        {!loading && !error && periodComparison && Math.abs(periodComparison.pctChange) >= ALERT_THRESHOLD_PCT && (
-          <div style={{
-            display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderRadius: 10, marginBottom: 16,
-            background: periodComparison.pctChange > 0 ? 'var(--warn-bg, #FBEFEA)' : 'var(--ok-bg, #EAF6EF)',
-            border: '1px solid ' + (periodComparison.pctChange > 0 ? '#E3B8A6' : '#A8D9BC'),
-            color: periodComparison.pctChange > 0 ? '#8A3A20' : '#1F6B3F'
-          }}>
-            <span style={{ fontSize: 16 }}>{periodComparison.pctChange > 0 ? '⚠️' : '✅'}</span>
-            <span style={{ fontSize: 13 }}>
-              <strong>{department}</strong> cost per kg is <strong>{periodComparison.pctChange > 0 ? 'up' : 'down'} {Math.abs(periodComparison.pctChange).toFixed(0)}%</strong> vs
-              the previous {periodComparison.priorCount} uploaded date{periodComparison.priorCount > 1 ? 's' : ''}
-              {' '}({fmtRate(periodComparison.priorRate)} → {fmtRate(periodComparison.currentRate)} Rs/kg)
-            </span>
-          </div>
-        )}
-
         {!loading && !error && rows && rows.length > 0 && (
           <StatRow qty={totals.qty} total={totals.total} entries={totals.count} fmt={fmt} />
         )}
 
         {!loading && !error && rows && rows.length > 0 && (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', gap: 16, marginBottom: 16 }}>
-            <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, padding: '16px 16px 8px' }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 8 }}>
-                Cost breakdown <span style={{ fontWeight: 400, color: 'var(--ink-3)' }}>({department}, this selection)</span>
-              </div>
-              <CostBreakdownChart totals={totals} />
+          <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, padding: '16px 16px 8px', marginBottom: 16 }}>
+            <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 8 }}>
+              Department comparison <span style={{ fontWeight: 400, color: 'var(--ink-3)' }}>(all departments, this date range)</span>
             </div>
-            <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, padding: '16px 16px 8px' }}>
-              <div style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)', marginBottom: 8 }}>
-                Department comparison <span style={{ fontWeight: 400, color: 'var(--ink-3)' }}>(all departments, this date range)</span>
-              </div>
+            <div style={{ maxWidth: 600, margin: '0 auto' }}>
               <DepartmentComparisonChart data={deptComparison} currentDept={department} />
             </div>
           </div>
@@ -1021,7 +968,7 @@ function App() {
 function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress }) {
   return (
     <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
-      <div className="topbar-row" style={{ maxWidth: 1440, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
+      <div className="topbar-row" style={{ maxWidth: 1650, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, flexShrink: 0 }}>
           <div style={{ width: 26, height: 26, borderRadius: 6, background: 'var(--accent)', color: 'var(--accent-ink)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13, flexShrink: 0 }}>B</div>
           <span className="topbar-brand-text" style={{ fontWeight: 600, fontSize: 15, whiteSpace: 'nowrap' }}>Batchwise tracker</span>
@@ -1072,7 +1019,7 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
         </div>
       </div>
       <div style={{
-        maxWidth: 1440, margin: '0 auto', padding: '0 24px 10px',
+        maxWidth: 1650, margin: '0 auto', padding: '0 24px 10px',
         fontSize: 12, color: 'var(--ink-2)', textAlign: 'right'
       }}>
         Only upload the <strong>&ldquo;Batch Wise Cost&rdquo;</strong> sheet — work center, alloy, and batch views are generated automatically from it.
@@ -1595,65 +1542,6 @@ function MonthlyAlloyTrendChart({ allRows, department, alloys }) {
     <div style={{ position: 'relative', height: 280 }}>
       <ChartResetButton chartRef={chartRef} />
       <canvas ref={canvasRef} role="img" aria-label="Line chart of Rs per kg cost by month, one line per alloy. Hover a point for qty and total production. Scroll to zoom, drag to pan."></canvas>
-    </div>
-  );
-}
-
-/* ============================================================
-   COST BREAKDOWN CHART (Store vs Power vs Labour, Rs/kg,
-   for the current department + selected date range)
-============================================================ */
-function CostBreakdownChart({ totals }) {
-  const canvasRef = useRef(null);
-  const chartRef = useRef(null);
-  const rate = (v) => totals.qty ? v / totals.qty : 0;
-  const categories = useMemo(() => ([
-    { label: 'Store', value: rate(totals.storeD + totals.storeI) },
-    { label: 'Power', value: rate(totals.powerD + totals.powerI) },
-    { label: 'Labour', value: rate(totals.labD + totals.labI) }
-  ]), [totals]);
-
-  useEffect(() => {
-    if (!canvasRef.current || typeof Chart === 'undefined') return;
-    if (chartRef.current) chartRef.current.destroy();
-    chartRef.current = new Chart(canvasRef.current, {
-      type: 'bar',
-      data: {
-        labels: categories.map(c => c.label),
-        datasets: [{
-          data: categories.map(c => c.value),
-          backgroundColor: [TREND_LINE_COLORS[1], TREND_LINE_COLORS[3], TREND_LINE_COLORS[0]],
-          borderRadius: 6,
-          barThickness: 28
-        }]
-      },
-      options: {
-        indexAxis: 'y',
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: { display: false },
-          tooltip: { callbacks: { label: ctx => ctx.parsed.x.toFixed(3) + ' Rs/kg' } }
-        },
-        scales: {
-          x: { title: { display: true, text: 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } },
-          y: { grid: { display: false } }
-        }
-      }
-    });
-    return () => { if (chartRef.current) chartRef.current.destroy(); };
-  }, [categories]);
-
-  const grandTotal = categories.reduce((s, c) => s + c.value, 0);
-
-  return (
-    <div style={{ position: 'relative', height: 150 }}>
-      <canvas ref={canvasRef} role="img" aria-label="Bar chart of cost breakdown by Store, Power and Labour, in Rs per kg"></canvas>
-      {grandTotal === 0 && (
-        <div style={{ position: 'absolute', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', fontSize: 13, color: 'var(--ink-3)' }}>
-          No cost data for this selection
-        </div>
-      )}
     </div>
   );
 }
