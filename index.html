@@ -67,6 +67,13 @@
     .spin { animation: none; }
     .fade-in { animation: none; }
   }
+
+  @media (max-width: 560px) {
+    .btn-label { display: none; }
+    .topbar-brand-text { display: none; }
+    .topbar-row { gap: 8px !important; }
+    .topbar-btn { padding: 9px 10px !important; }
+  }
 </style>
 </head>
 <body>
@@ -453,6 +460,9 @@ function IconX() {
 function IconUpload() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 16V4M12 4l-4 4M12 4l4 4"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>;
 }
+function IconDownload() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M12 4v12M12 16l-4-4M12 16l4-4"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>;
+}
 function IconMoon() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>;
 }
@@ -486,6 +496,8 @@ function App() {
   const [toDate, setToDate] = useState(null);
   const [department, setDepartment] = useState('CCP / Mill');
   const [view, setView] = useState('wc');
+  const [sortKey, setSortKey] = useState(null);
+  const [sortDir, setSortDir] = useState('desc');
   const [search, setSearch] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
@@ -666,6 +678,11 @@ function App() {
     if (view === 'batch' && !hasBatch) setView('wc');
   }, [hasBatch, view]);
 
+  useEffect(() => {
+    setSortKey(null);
+    setSortDir('desc');
+  }, [view]);
+
   const aggregated = useMemo(() => {
     if (view === 'wc') return aggregateBy(deptRows, r => normKey(r.wc), r => normKey(r.wc));
     if (view === 'alloy') return aggregateBy(
@@ -700,15 +717,69 @@ function App() {
     );
   }, [aggregated, search]);
 
+  const sortedFiltered = useMemo(() => {
+    if (!sortKey) return filtered;
+    const copy = [...filtered];
+    copy.sort((a, b) => {
+      const av = a[sortKey], bv = b[sortKey];
+      if (typeof av === 'string' || typeof bv === 'string') {
+        const cmp = String(av || '').localeCompare(String(bv || ''));
+        return sortDir === 'asc' ? cmp : -cmp;
+      }
+      return sortDir === 'asc' ? (av - bv) : (bv - av);
+    });
+    return copy;
+  }, [filtered, sortKey, sortDir]);
+
+  function handleSort(key) {
+    if (sortKey === key) setSortDir(d => (d === 'asc' ? 'desc' : 'asc'));
+    else { setSortKey(key); setSortDir('desc'); }
+  }
+
+  function handleExportCsv() {
+    if (!sortedFiltered.length) return;
+    const headers = COLS_AGG.map(([, label]) => label);
+    const lines = [headers.join(',')];
+    sortedFiltered.forEach(r => {
+      const cells = COLS_AGG.map(([key]) => {
+        const isRateCol = key === 'rate' || key.endsWith('Rate');
+        const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
+        let val;
+        if (isRateCol) val = r[key].toFixed(2);
+        else if (isTextCol) val = r[key] || '';
+        else val = Math.round(r[key]);
+        val = String(val);
+        // quote any value containing a comma so the CSV stays valid
+        return val.includes(',') ? '"' + val.replace(/"/g, '""') + '"' : val;
+      });
+      lines.push(cells.join(','));
+    });
+    const csv = lines.join('\n');
+    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    const rangeLabel = fromDate === toDate ? keyToLabel(fromDate) : keyToLabel(fromDate) + '_to_' + keyToLabel(toDate);
+    a.href = url;
+    a.download = 'batchwise_' + department.replace(/[^a-z0-9]+/gi, '_') + '_' + view + '_' + rangeLabel.replace(/\s+/g, '') + '.csv';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    URL.revokeObjectURL(url);
+  }
+
   const totals = useMemo(() => {
-    return deptRows.reduce((acc, r) => {
+    // deriving from `filtered` (not raw deptRows) means these numbers respect
+    // both the current view's grouping and the search box — so typing a
+    // search narrows the stat cards too, not just the table below them.
+    return filtered.reduce((acc, r) => {
       acc.qty += r.qty; acc.total += r.total;
       acc.storeD += r.storeD; acc.storeI += r.storeI;
       acc.labD += r.labD; acc.labI += r.labI;
       acc.powerD += r.powerD; acc.powerI += r.powerI;
+      acc.count += r.count;
       return acc;
-    }, { qty: 0, total: 0, storeD: 0, storeI: 0, labD: 0, labI: 0, powerD: 0, powerI: 0 });
-  }, [deptRows]);
+    }, { qty: 0, total: 0, storeD: 0, storeI: 0, labD: 0, labI: 0, powerD: 0, powerI: 0, count: 0 });
+  }, [filtered]);
 
   // department comparison — every department, for the current date range,
   // regardless of which one is currently selected in the dropdown above
@@ -725,6 +796,37 @@ function App() {
       return { dept: d, qty: b ? b.qty : 0, rate: b && b.qty ? b.total / b.qty : 0 };
     });
   }, [rows]);
+
+  // compares the currently selected date range against the same number of
+  // immediately-preceding uploaded dates for this department, so a plant
+  // head sees a warning the moment cost per kg moves a lot, without having
+  // to remember last period's numbers themselves.
+  const ALERT_THRESHOLD_PCT = 15;
+  const periodComparison = useMemo(() => {
+    if (!allRows || !fromDate || !toDate) return null;
+    const deptAllDates = Array.from(new Set(allRows.filter(r => r.dept === department).map(r => r.date))).sort();
+    const lo = fromDate <= toDate ? fromDate : toDate;
+    const hi = fromDate <= toDate ? toDate : fromDate;
+    const currentDates = deptAllDates.filter(d => d >= lo && d <= hi);
+    if (!currentDates.length) return null;
+    const priorDates = deptAllDates.filter(d => d < lo).slice(-currentDates.length);
+    if (!priorDates.length) return null;
+
+    function rateFor(dateList) {
+      const set = new Set(dateList);
+      let qty = 0, total = 0;
+      allRows.forEach(r => {
+        if (r.dept === department && set.has(r.date)) { qty += r.qty; total += r.total; }
+      });
+      return qty ? total / qty : 0;
+    }
+
+    const currentRate = rateFor(currentDates);
+    const priorRate = rateFor(priorDates);
+    if (!priorRate) return null;
+    const pctChange = ((currentRate - priorRate) / priorRate) * 100;
+    return { currentRate, priorRate, pctChange, currentCount: currentDates.length, priorCount: priorDates.length };
+  }, [allRows, department, fromDate, toDate]);
 
   const activeFilters = [];
   if (search.trim()) activeFilters.push({ key: 'search', label: 'Search: "' + search.trim() + '"', clear: () => setSearch('') });
@@ -753,6 +855,8 @@ function App() {
         theme={theme} setTheme={setTheme}
         search={search} setSearch={setSearch}
         onUploadClick={() => fileInputRef.current && fileInputRef.current.click()}
+        onExport={handleExportCsv}
+        canExport={!!(rows && rows.length)}
         uploading={uploading}
         uploadProgress={uploadProgress}
       />
@@ -777,8 +881,24 @@ function App() {
           </div>
         )}
 
+        {!loading && !error && periodComparison && Math.abs(periodComparison.pctChange) >= ALERT_THRESHOLD_PCT && (
+          <div style={{
+            display: 'flex', alignItems: 'center', gap: 10, padding: '12px 16px', borderRadius: 10, marginBottom: 16,
+            background: periodComparison.pctChange > 0 ? 'var(--warn-bg, #FBEFEA)' : 'var(--ok-bg, #EAF6EF)',
+            border: '1px solid ' + (periodComparison.pctChange > 0 ? '#E3B8A6' : '#A8D9BC'),
+            color: periodComparison.pctChange > 0 ? '#8A3A20' : '#1F6B3F'
+          }}>
+            <span style={{ fontSize: 16 }}>{periodComparison.pctChange > 0 ? '⚠️' : '✅'}</span>
+            <span style={{ fontSize: 13 }}>
+              <strong>{department}</strong> cost per kg is <strong>{periodComparison.pctChange > 0 ? 'up' : 'down'} {Math.abs(periodComparison.pctChange).toFixed(0)}%</strong> vs
+              the previous {periodComparison.priorCount} uploaded date{periodComparison.priorCount > 1 ? 's' : ''}
+              {' '}({fmtRate(periodComparison.priorRate)} → {fmtRate(periodComparison.currentRate)} Rs/kg)
+            </span>
+          </div>
+        )}
+
         {!loading && !error && rows && rows.length > 0 && (
-          <StatRow qty={totals.qty} total={totals.total} entries={deptRows.length} fmt={fmt} />
+          <StatRow qty={totals.qty} total={totals.total} entries={totals.count} fmt={fmt} />
         )}
 
         {!loading && !error && rows && rows.length > 0 && (
@@ -877,7 +997,8 @@ function App() {
               onAction={search ? () => setSearch('') : null}
             />
           ) : (
-            <DataTable cols={COLS_AGG} rows={filtered} fmt={fmt} fmtRate={fmtRate} view={view} />
+            <DataTable cols={COLS_AGG} rows={sortedFiltered} fmt={fmt} fmtRate={fmtRate} view={view}
+              sortKey={sortKey} sortDir={sortDir} onSort={handleSort} />
           )}
         </div>
       </main>
@@ -897,16 +1018,16 @@ function App() {
 /* ============================================================
    TOP BAR
 ============================================================ */
-function TopBar({ theme, setTheme, search, setSearch, onUploadClick, uploading, uploadProgress }) {
+function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress }) {
   return (
     <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
-      <div style={{ maxWidth: 1200, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16 }}>
+      <div className="topbar-row" style={{ maxWidth: 1200, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 9, flexShrink: 0 }}>
-          <div style={{ width: 26, height: 26, borderRadius: 6, background: 'var(--accent)', color: 'var(--accent-ink)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13 }}>B</div>
-          <span style={{ fontWeight: 600, fontSize: 15 }}>Batchwise tracker</span>
+          <div style={{ width: 26, height: 26, borderRadius: 6, background: 'var(--accent)', color: 'var(--accent-ink)', display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 700, fontSize: 13, flexShrink: 0 }}>B</div>
+          <span className="topbar-brand-text" style={{ fontWeight: 600, fontSize: 15, whiteSpace: 'nowrap' }}>Batchwise tracker</span>
         </div>
 
-        <div style={{ flex: 1, maxWidth: 440, position: 'relative' }}>
+        <div style={{ flex: '1 1 160px', minWidth: 120, maxWidth: 440, position: 'relative' }}>
           <span style={{ position: 'absolute', left: 12, top: '50%', transform: 'translateY(-50%)', color: 'var(--ink-3)', display: 'flex' }}>
             <IconSearch />
           </span>
@@ -921,23 +1042,34 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, uploading, 
           />
         </div>
 
-        <div style={{ flex: 1 }} />
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto', flexShrink: 0 }}>
+          <button onClick={onExport} disabled={!canExport} className="focus-ring topbar-btn" style={{
+            display: 'flex', alignItems: 'center', gap: 7, padding: '9px 14px', borderRadius: 8,
+            border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13,
+            opacity: canExport ? 1 : 0.5, cursor: canExport ? 'pointer' : 'not-allowed'
+          }} title={canExport ? 'Download current view as CSV' : 'No data to export yet'}>
+            <IconDownload />
+            <span className="btn-label">Export</span>
+          </button>
 
-        <button onClick={onUploadClick} disabled={uploading} className="focus-ring" style={{
-          display: 'flex', alignItems: 'center', gap: 7, padding: '9px 14px', borderRadius: 8,
-          border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13,
-          opacity: uploading ? 0.6 : 1
-        }}>
-          {uploading ? <span className="spin" style={{ width: 14, height: 14, border: '2px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} /> : <IconUpload />}
-          {uploading
-            ? (uploadProgress ? 'Uploading ' + uploadProgress.current + '/' + uploadProgress.total + '…' : 'Uploading…')
-            : 'Upload'}
-        </button>
+          <button onClick={onUploadClick} disabled={uploading} className="focus-ring topbar-btn" style={{
+            display: 'flex', alignItems: 'center', gap: 7, padding: '9px 14px', borderRadius: 8,
+            border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13,
+            opacity: uploading ? 0.6 : 1
+          }}>
+            {uploading ? <span className="spin" style={{ width: 14, height: 14, border: '2px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} /> : <IconUpload />}
+            <span className="btn-label">
+              {uploading
+                ? (uploadProgress ? 'Uploading ' + uploadProgress.current + '/' + uploadProgress.total + '…' : 'Uploading…')
+                : 'Upload'}
+            </span>
+          </button>
 
-        <button onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')} className="focus-ring" aria-label="Toggle dark mode"
-          style={{ display: 'flex', padding: 9, borderRadius: 8, border: '1px solid var(--line-strong)', background: 'var(--surface)' }}>
-          {theme === 'dark' ? <IconSun /> : <IconMoon />}
-        </button>
+          <button onClick={() => setTheme(t => t === 'dark' ? 'light' : 'dark')} className="focus-ring" aria-label="Toggle dark mode"
+            style={{ display: 'flex', padding: 9, borderRadius: 8, border: '1px solid var(--line-strong)', background: 'var(--surface)' }}>
+            {theme === 'dark' ? <IconSun /> : <IconMoon />}
+          </button>
+        </div>
       </div>
       <div style={{
         maxWidth: 1200, margin: '0 auto', padding: '0 24px 10px',
@@ -1287,9 +1419,16 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
   }
 
   return (
-    <div style={{ position: 'relative', height: 280 }}>
-      <ChartResetButton chartRef={chartRef} />
-      <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Line chart of Rs per kg cost over time. Hover a point to see quantity. Scroll to zoom, drag to pan."}></canvas>
+    <div>
+      {dates.length <= 1 && (
+        <div style={{ fontSize: 12, color: 'var(--ink-3)', marginBottom: 6 }}>
+          Only one date selected — widen the From/To range above to see a trend line instead of single points.
+        </div>
+      )}
+      <div style={{ position: 'relative', height: 280 }}>
+        <ChartResetButton chartRef={chartRef} />
+        <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Line chart of Rs per kg cost over time. Hover a point to see quantity. Scroll to zoom, drag to pan."}></canvas>
+      </div>
     </div>
   );
 }
@@ -1626,20 +1765,26 @@ function BatchCostChart({ rows, title }) {
 /* ============================================================
    DATA TABLE
 ============================================================ */
-function DataTable({ cols, rows, fmt, fmtRate, view }) {
+function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort }) {
   return (
     <div style={{ overflowX: 'auto' }}>
       <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, minWidth: 820 }}>
         <thead>
           <tr>
-            {cols.map(([key, label, align], colIdx) => (
-              <th key={key} style={{
-                textAlign: align, padding: '10px 14px', fontSize: 12, fontWeight: 600,
-                color: 'var(--ink-2)', borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap',
-                position: 'sticky', top: 0, background: 'var(--surface)',
-                ...(colIdx === 0 ? { left: 0, zIndex: 3, boxShadow: '2px 0 4px -2px rgba(0,0,0,0.08)' } : { zIndex: 2 })
-              }}>{label}</th>
-            ))}
+            {cols.map(([key, label, align], colIdx) => {
+              const isActive = sortKey === key;
+              return (
+                <th key={key} onClick={() => onSort && onSort(key)} style={{
+                  textAlign: align, padding: '10px 14px', fontSize: 12, fontWeight: 600,
+                  color: isActive ? 'var(--accent)' : 'var(--ink-2)', borderBottom: '1px solid var(--line)', whiteSpace: 'nowrap',
+                  position: 'sticky', top: 0, background: 'var(--surface)',
+                  cursor: onSort ? 'pointer' : 'default', userSelect: 'none',
+                  ...(colIdx === 0 ? { left: 0, zIndex: 3, boxShadow: '2px 0 4px -2px rgba(0,0,0,0.08)' } : { zIndex: 2 })
+                }}>
+                  {label}{isActive ? (sortDir === 'asc' ? ' \u2191' : ' \u2193') : ''}
+                </th>
+              );
+            })}
           </tr>
         </thead>
         <tbody>
