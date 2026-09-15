@@ -85,18 +85,12 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/hammer.js/2.0.8/hammer.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/chartjs-plugin-zoom/2.2.0/chartjs-plugin-zoom.min.js"></script>
 
 <script type="text/babel-jsx" id="app-source">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
 
 if (typeof pdfjsLib !== 'undefined') {
   pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
-}
-
-if (typeof Chart !== 'undefined' && typeof ChartZoom !== 'undefined') {
-  Chart.register(ChartZoom);
 }
 
 /* ============================================================
@@ -1127,30 +1121,11 @@ function MultiValueCell({ value }) {
 /* ============================================================
    BATCH COST CHART (Rs/kg per batch, line chart)
 ============================================================ */
-function ChartResetButton({ chartRef }) {
-  return (
-    <button onClick={() => chartRef.current && chartRef.current.resetZoom()} className="focus-ring" style={{
-      position: 'absolute', top: 0, right: 0, fontSize: 11, fontWeight: 600, padding: '4px 8px',
-      borderRadius: 6, border: '1px solid var(--line)', background: 'var(--surface-2)', color: 'var(--ink-2)', zIndex: 2
-    }}>Reset zoom</button>
-  );
-}
 
 /* ============================================================
    ALLOY TREND CHART
 ============================================================ */
 const TREND_LINE_COLORS = ['#B54E2E', '#2E6FBF', '#1E9E6B', '#D9A400', '#C0568A', '#6B4FBF', '#2AA198', '#C4453A', '#7A8B3F', '#8B5A2B'];
-
-const ZOOM_PAN_OPTIONS = {
-  pan: { enabled: true, mode: 'x', modifierKey: null },
-  zoom: {
-    wheel: { enabled: true, speed: 0.08 },
-    pinch: { enabled: true },
-    drag: { enabled: false },
-    mode: 'x'
-  },
-  limits: { x: { minRange: 2 } }
-};
 
 function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate) {
   groupField = groupField || 'mat';
@@ -1221,7 +1196,6 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
         maintainAspectRatio: false,
         plugins: {
           legend: { display: true, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
-          zoom: ZOOM_PAN_OPTIONS,
           tooltip: {
             callbacks: {
               label: (ctx) => {
@@ -1259,8 +1233,7 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
         </div>
       )}
       <div style={{ position: 'relative', height: 280 }}>
-        <ChartResetButton chartRef={chartRef} />
-        <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Line chart of Rs per kg cost over time. Hover a point to see quantity. Scroll to zoom, drag to pan."}></canvas>
+        <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Line chart of Rs per kg cost over time. Hover a point to see quantity."}></canvas>
       </div>
     </div>
   );
@@ -1295,7 +1268,7 @@ function BatchCostChart({ rows, title }) {
       options: {
         responsive: true,
         maintainAspectRatio: false,
-        plugins: { legend: { display: false }, zoom: ZOOM_PAN_OPTIONS },
+        plugins: { legend: { display: false } },
         scales: {
           x: { ticks: { autoSkip: rows.length > 25, maxRotation: 45, font: { size: 10 } }, grid: { display: false } },
           y: { title: { display: true, text: 'Rs / kg' }, grid: { color: '#E7E2D8' } }
@@ -1312,8 +1285,7 @@ function BatchCostChart({ rows, title }) {
     }}>
       <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 8, color: 'var(--ink-2)' }}>{title}</div>
       <div style={{ position: 'relative', height: 240 }}>
-        <ChartResetButton chartRef={chartRef} />
-        <canvas ref={canvasRef} role="img" aria-label={title + ' — line chart. Scroll to zoom, drag to pan.'}></canvas>
+        <canvas ref={canvasRef} role="img" aria-label={title + ' — line chart.'}></canvas>
       </div>
     </div>
   );
