@@ -128,10 +128,6 @@ async function sheetGetMeta(key) {
 }
 async function sheetSetMeta(key, value) {
   cache['meta:' + key] = value;
-  // Apps Script Web Apps don't send CORS headers on POST responses, so the
-  // browser blocks reading them even though the write itself succeeds
-  // server-side. no-cors mode fires the request without needing to read
-  // the (unreadable) response — the write still lands correctly.
   await fetch(GOOGLE_SHEET_API_URL, {
     method: 'POST',
     mode: 'no-cors',
@@ -200,9 +196,6 @@ function findCol(headers, exact, contains, exclude) {
   return -1;
 }
 
-// Prefer the SAP Amount column because the app aggregates amounts and then
-// calculates Rs/kg as amount / quantity. If an export contains only Rs/kg,
-// the parser can still convert that rate to an amount using qty.
 function findCostColumns(headers, family, type) {
   const amount = findCol(headers,
     [family + ' Amount'],
@@ -242,9 +235,6 @@ function keyToLabel(key) {
   return d + ' ' + months[parseInt(m, 10) - 1] + ' ' + y;
 }
 
-// groups names that differ only by case or extra whitespace — a common SAP
-// export inconsistency between different days' files — so the same machine
-// or alloy doesn't show up twice under slightly different spellings.
 function normKey(s) {
   return (s || '').trim().replace(/\s+/g, ' ').toUpperCase();
 }
@@ -281,11 +271,8 @@ async function extractRowsFromPdf(arrayBuffer) {
     const sortedYs = Object.keys(rowMap).map(Number).sort((a, b) => b - a);
     sortedYs.forEach(y => {
       const cells = rowMap[y].sort((a, b) => a.x - b.x).map(c => c.str);
-      // title lines and page-number lines never have anywhere near the
-      // full column count, so this alone filters them out reliably.
       if (cells.length < 10) return;
       if (cells[0] === 'Company Code') {
-        // repeated header row (appears on every page) — capture once, skip as data
         if (!headerRow) headerRow = cells;
         return;
       }
@@ -322,8 +309,6 @@ async function parseWorkbook(arrayBuffer, isPdf) {
   const dateCol = findCol(headers, ['Posting Date'], ['posting', 'date']);
   const qtyCol = findCol(headers, ['Quantity', 'Qty'], ['qty'], ['unit']);
 
-  // IMPORTANT: these are intentionally resolved as Amount + Rs/KG pairs.
-  // Amount is stored in the backend; the UI derives Rs/KG by dividing by Qty.
   const storeDCols = findCostColumns(headers, 'Store Direct', 'storeD');
   const storeICols = findCostColumns(headers, 'Store Indirect', 'storeI');
   const powerDCols = findCostColumns(headers, 'Power Direct', 'powerD');
@@ -402,6 +387,7 @@ function aggregateBy(rows, keyFn, nameFn) {
     if (!buckets[k]) {
       buckets[k] = {
         name: nameFn ? nameFn(r) : k,
+        date: r.date,
         count: 0,
         qty: 0,
         storeD: 0,
@@ -411,7 +397,7 @@ function aggregateBy(rows, keyFn, nameFn) {
         powerD: 0,
         powerI: 0,
         total: 0,
-        wcs: {},      // normKey -> first-seen display text, avoids case/space duplicates
+        wcs: {},
         mats: {},
         matCodes: {}
       };
@@ -433,9 +419,6 @@ function aggregateBy(rows, keyFn, nameFn) {
       ...b,
       wc: Object.values(b.wcs).join(', '),
       material: Object.values(b.mats).join(', '),
-      // Batch view groups by Batch + Material Code, therefore this is
-      // normally exactly one code. Keeping a simple string here avoids
-      // showing misleading multi-code values for one production row.
       matCode: Object.values(b.matCodes)[0] || '',
       rate: b.qty ? b.total / b.qty : 0,
       storeDRate: b.qty ? b.storeD / b.qty : 0,
@@ -491,7 +474,7 @@ function Chip({ label, onRemove }) {
 ============================================================ */
 function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('bwt-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
-  const [allRows, setAllRows] = useState(null); // every row, every date — loaded once
+  const [allRows, setAllRows] = useState(null);
   const [fromDate, setFromDate] = useState(null);
   const [toDate, setToDate] = useState(null);
   const [department, setDepartment] = useState('CCP / Mill');
@@ -515,8 +498,6 @@ function App() {
     setTimeout(() => setToast(t => (t && t.msg === msg ? null : t)), isError ? 5000 : 3000);
   }, []);
 
-  // dates present in the data, newest first — derived, never a separate
-  // thing that can drift out of sync with what was actually uploaded
   const dateIndex = useMemo(() => {
     if (!allRows) return [];
     return Array.from(new Set(allRows.map(r => r.date))).sort().reverse();
@@ -539,9 +520,6 @@ function App() {
 
   useEffect(() => { loadAll(); }, [loadAll]);
 
-  // rows within the selected From–To range — pure client-side slice, instant.
-  // when From and To are the same date (the default), this behaves exactly
-  // like the old single-date selector.
   const rows = useMemo(() => {
     if (!allRows || !fromDate || !toDate) return allRows === null ? null : [];
     const lo = fromDate <= toDate ? fromDate : toDate;
@@ -570,8 +548,6 @@ function App() {
           if (!dates.length) throw new Error('No usable rows found.');
           for (const dk of dates) {
             await setDayRows(dk, byDate[dk]);
-            // optimistic client-side update — replace this date's rows
-            // immediately rather than waiting on a fresh full reload
             updatedRows = updatedRows.filter(r => r.date !== dk)
               .concat(byDate[dk].map(r => ({ ...r, date: dk })));
             loadedLabels.push(keyToLabel(dk));
@@ -614,18 +590,6 @@ function App() {
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
   }, [deptRows]);
 
-  // for the trend charts specifically: the set of alloy lines shown must stay
-  // the same no matter which single date is picked up top, otherwise every
-  // date switch reshuffles which lines appear. This looks across every
-  // uploaded date for the department, not just the currently selected one.
-  // groups names that differ only by case or extra whitespace (a common SAP
-  // export inconsistency between different days' files) so they don't show
-  // up as separate, duplicate-looking lines in the trend charts.
-  // using shared normKey() defined near keyToLabel
-
-  // the search box should narrow the trend charts too, not just the table —
-  // otherwise typing "MILLING" filters the table but the charts above keep
-  // showing every alloy/machine, which looks like the search did nothing.
   const searchedAllRows = useMemo(() => {
     if (!allRows) return allRows;
     if (!search.trim()) return allRows;
@@ -643,23 +607,15 @@ function App() {
     const display = {};
     searchedAllRows.forEach(r => {
       if (r.dept !== department || !r.mat) return;
-      // dross / scrap / process scrap are recovered by-product materials,
-      // not primary alloys — they shouldn't show up as their own trend line
       const nameLower = r.mat.toLowerCase();
       if (nameLower.includes('dross') || nameLower.includes('scrap')) return;
       const key = normKey(r.mat);
       totals[key] = (totals[key] || 0) + r.qty;
       if (!display[key]) display[key] = r.mat.trim();
     });
-    // cap to the top 10 by quantity — this matches the trend chart's color
-    // palette size (10 colors) so no two lines ever end up the same color,
-    // and it keeps small-volume by-product materials from cluttering the
-    // legend when a department accumulates many material codes over time.
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10).map(k => display[k]);
   }, [searchedAllRows, department]);
 
-  // same idea as allTimeAlloyOptions, but grouped by work center (machine)
-  // instead of material — for the "by machine" trend chart.
   const allTimeMachineOptions = useMemo(() => {
     if (!searchedAllRows) return [];
     const totals = {};
@@ -668,9 +624,6 @@ function App() {
       const key = normKey(r.wc);
       totals[key] = (totals[key] || 0) + r.qty;
     });
-    // use the normalized (upper-case, single-spaced) form directly as the
-    // display name too, so every machine shows in one consistent format
-    // regardless of how it was spaced/cased in a given SAP export.
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10);
   }, [searchedAllRows, department]);
 
@@ -684,22 +637,19 @@ function App() {
   }, [view]);
 
   const aggregated = useMemo(() => {
-    if (view === 'wc') return aggregateBy(deptRows, r => normKey(r.wc), r => normKey(r.wc));
+    if (view === 'wc') return aggregateBy(deptRows, r => r.date + '||' + normKey(r.wc), r => normKey(r.wc));
     if (view === 'alloy') return aggregateBy(
       deptRows,
-      r => normKey(r.mat || 'Unspecified') + '||' + normKey(r.wc),
+      r => r.date + '||' + normKey(r.mat || 'Unspecified') + '||' + normKey(r.wc),
       r => (r.mat || 'Unspecified').trim()
     );
     if (view === 'batch') {
-      // IMPORTANT: a batch can contain multiple material codes.
-      // Each Batch + Material Code combination must have its own
-      // quantity/cost aggregation so costs never get mixed.
       return aggregateBy(
         deptRows,
         r => {
           const batch = r.batch || 'Unknown batch';
           const materialCode = r.matCode || 'Unknown material code';
-          return batch + '||' + materialCode;
+          return r.date + '||' + batch + '||' + materialCode;
         },
         r => r.batch || 'Unknown batch'
       );
@@ -744,12 +694,13 @@ function App() {
       const cells = COLS_AGG.map(([key]) => {
         const isRateCol = key === 'rate' || key.endsWith('Rate');
         const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
+        const isDateCol = key === 'date';
         let val;
-        if (isRateCol) val = r[key].toFixed(2);
+        if (isDateCol) val = keyToLabel(r[key]);
+        else if (isRateCol) val = r[key].toFixed(2);
         else if (isTextCol) val = r[key] || '';
         else val = Math.round(r[key]);
         val = String(val);
-        // quote any value containing a comma so the CSV stays valid
         return val.includes(',') ? '"' + val.replace(/"/g, '""') + '"' : val;
       });
       lines.push(cells.join(','));
@@ -768,9 +719,6 @@ function App() {
   }
 
   const totals = useMemo(() => {
-    // deriving from `filtered` (not raw deptRows) means these numbers respect
-    // both the current view's grouping and the search box — so typing a
-    // search narrows the stat cards too, not just the table below them.
     return filtered.reduce((acc, r) => {
       acc.qty += r.qty; acc.total += r.total;
       acc.storeD += r.storeD; acc.storeI += r.storeI;
@@ -788,6 +736,7 @@ function App() {
   const fmtRate = n => n.toFixed(2);
 
   const COLS_AGG = [
+    ['date', 'Date', 'left'],
     ['name', view === 'batch' ? 'Batch' : view === 'wc' ? 'Machine' : view === 'alloy' ? 'Material' : 'Name', 'left'],
     ...(view === 'batch' ? [['wc', 'Work center', 'left'], ['matCode', 'Material code', 'left']] : []),
     ...(view === 'alloy' ? [['wc', 'Machine', 'left']] : []),
@@ -867,35 +816,6 @@ function App() {
               ariaLabel="Line chart of Rs per kg cost over time, one line per machine. Hover a point to see quantity." />
           </div>
         )}
-
-        {/* "Qty over time" and "Cost per kg by month" charts commented out
-            per request — only "Cost per kg over time" stays visible.
-        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
-          <div style={{
-            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
-            padding: '16px 16px 8px', marginBottom: 16
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Qty over time</span>
-              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department})</span>
-            </div>
-            <AlloyQtyTrendChart allRows={allRows} department={department} alloys={allTimeAlloyOptions} />
-          </div>
-        )}
-
-        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
-          <div style={{
-            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
-            padding: '16px 16px 8px', marginBottom: 16
-          }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg by month</span>
-              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — hover for qty and total production)</span>
-            </div>
-            <MonthlyAlloyTrendChart allRows={allRows} department={department} alloys={allTimeAlloyOptions} />
-          </div>
-        )}
-        */}
 
         <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
           {loading ? (
@@ -1007,7 +927,7 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
 const MONTH_NAMES_FULL = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
 function DateRangeCalendarPicker({ dateIndex, fromDate, setFromDate, toDate, setToDate }) {
-  const [openRole, setOpenRole] = useState(null); // 'from' | 'to' | null
+  const [openRole, setOpenRole] = useState(null);
   const [viewYear, setViewYear] = useState(null);
   const [viewMonth, setViewMonth] = useState(null);
   const wrapRef = useRef(null);
@@ -1217,8 +1137,7 @@ function ChartResetButton({ chartRef }) {
 }
 
 /* ============================================================
-   ALLOY TREND CHART (Rs/kg for every alloy, across all dates,
-   summed across every machine in the department, one line each)
+   ALLOY TREND CHART
 ============================================================ */
 const TREND_LINE_COLORS = ['#B54E2E', '#2E6FBF', '#1E9E6B', '#D9A400', '#C0568A', '#6B4FBF', '#2AA198', '#C4453A', '#7A8B3F', '#8B5A2B'];
 
@@ -1236,10 +1155,6 @@ const ZOOM_PAN_OPTIONS = {
 function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate) {
   groupField = groupField || 'mat';
   if (!allRows || !groupValues.length) return { dates: [], rateDatasets: [], qtyDatasets: [], totalQtyByDate: {} };
-  // using shared normKey() defined near keyToLabel
-  // map a normalized name back to the canonical display name from groupValues,
-  // so rows whose raw wc/mat differs only by case or extra whitespace still
-  // fold into the same line instead of appearing as a separate duplicate
   const canonicalByNormKey = {};
   groupValues.forEach(v => { canonicalByNormKey[normKey(v)] = v; });
   const dateSet = new Set();
@@ -1249,8 +1164,6 @@ function buildAlloyTrendData(allRows, department, groupValues, groupField, fromD
     if (r.dept !== department) return;
     if (fromDate && r.date < fromDate) return;
     if (toDate && r.date > toDate) return;
-    // total production for the date includes every group value in the
-    // department, not just the ones currently plotted as lines
     totalQtyByDate[r.date] = (totalQtyByDate[r.date] || 0) + r.qty;
     const canonical = canonicalByNormKey[normKey(r[groupField])];
     if (!canonical) return;
@@ -1353,172 +1266,6 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
   );
 }
 
-/* ============================================================
-   ALLOY QTY TREND CHART (Qty kg for every alloy, across dates)
-============================================================ */
-function AlloyQtyTrendChart({ allRows, department, alloys }) {
-  const canvasRef = useRef(null);
-  const chartRef = useRef(null);
-
-  const { dates, qtyDatasets } = useMemo(
-    () => buildAlloyTrendData(allRows, department, alloys),
-    [allRows, department, alloys]
-  );
-
-  useEffect(() => {
-    if (!canvasRef.current || typeof Chart === 'undefined') return;
-    if (chartRef.current) chartRef.current.destroy();
-    chartRef.current = new Chart(canvasRef.current, {
-      type: 'line',
-      data: { labels: dates.map(keyToLabel), datasets: qtyDatasets },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: { display: true, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
-          zoom: ZOOM_PAN_OPTIONS,
-          tooltip: {
-            callbacks: {
-              label: (ctx) => ctx.dataset.label + ': ' + (ctx.parsed.y != null ? Math.round(ctx.parsed.y).toLocaleString('en-IN') + ' kg' : 'no data')
-            }
-          }
-        },
-        scales: {
-          x: { ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
-          y: { title: { display: true, text: 'Qty (kg)' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
-        }
-      }
-    });
-    return () => { if (chartRef.current) chartRef.current.destroy(); };
-  }, [dates, qtyDatasets]);
-
-  if (!qtyDatasets.length) {
-    return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No trend data yet.</div>;
-  }
-
-  return (
-    <div style={{ position: 'relative', height: 280 }}>
-      <ChartResetButton chartRef={chartRef} />
-      <canvas ref={canvasRef} role="img" aria-label="Line chart of quantity in kg over time, one line per alloy. Scroll to zoom, drag to pan."></canvas>
-    </div>
-  );
-}
-
-/* ============================================================
-   MONTHLY ALLOY TREND CHART (Rs/kg for every alloy, grouped by
-   calendar month instead of by individual date)
-============================================================ */
-function monthKeyToLabel(key) {
-  const [y, m] = key.split('-');
-  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
-  return months[parseInt(m, 10) - 1] + ' ' + y;
-}
-
-function buildMonthlyAlloyTrendData(allRows, department, alloys) {
-  if (!allRows || !alloys.length) return { months: [], rateDatasets: [], totalQtyByMonth: {} };
-  const monthSet = new Set();
-  const byAlloyMonth = {};
-  const totalQtyByMonth = {};
-  allRows.forEach(r => {
-    if (r.dept !== department) return;
-    const monthKey = r.date.slice(0, 7); // "yyyy-mm"
-    totalQtyByMonth[monthKey] = (totalQtyByMonth[monthKey] || 0) + r.qty;
-    if (!alloys.includes(r.mat)) return;
-    monthSet.add(monthKey);
-    const key = r.mat + '||' + monthKey;
-    if (!byAlloyMonth[key]) byAlloyMonth[key] = { qty: 0, total: 0 };
-    byAlloyMonth[key].qty += r.qty;
-    byAlloyMonth[key].total += r.total;
-  });
-  const months = Array.from(monthSet).sort();
-  const rateDatasets = alloys.map((alloy, i) => ({
-    label: alloy,
-    data: months.map(m => {
-      const b = byAlloyMonth[alloy + '||' + m];
-      return b && b.qty ? b.total / b.qty : null;
-    }),
-    qty: months.map(m => {
-      const b = byAlloyMonth[alloy + '||' + m];
-      return b ? b.qty : null;
-    }),
-    borderColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
-    backgroundColor: TREND_LINE_COLORS[i % TREND_LINE_COLORS.length],
-    fill: false, tension: 0.3, pointRadius: 5, spanGaps: true
-  }));
-  return { months, rateDatasets, totalQtyByMonth };
-}
-
-function MonthlyAlloyTrendChart({ allRows, department, alloys }) {
-  const canvasRef = useRef(null);
-  const chartRef = useRef(null);
-
-  const { months, rateDatasets, totalQtyByMonth } = useMemo(
-    () => buildMonthlyAlloyTrendData(allRows, department, alloys),
-    [allRows, department, alloys]
-  );
-
-  useEffect(() => {
-    if (!canvasRef.current || typeof Chart === 'undefined') return;
-    if (chartRef.current) chartRef.current.destroy();
-    chartRef.current = new Chart(canvasRef.current, {
-      type: 'line',
-      data: { labels: months.map(monthKeyToLabel), datasets: rateDatasets },
-      options: {
-        responsive: true,
-        maintainAspectRatio: false,
-        plugins: {
-          legend: { display: true, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
-          zoom: ZOOM_PAN_OPTIONS,
-          tooltip: {
-            callbacks: {
-              label: (ctx) => {
-                const rate = ctx.parsed.y;
-                const rateText = rate != null ? rate.toFixed(2) + ' Rs/kg' : 'no data';
-                return ctx.dataset.label + ': ' + rateText;
-              },
-              footer: (items) => {
-                if (!items.length) return '';
-                const item = items[0];
-                const qty = item.dataset.qty ? item.dataset.qty[item.dataIndex] : null;
-                return 'Total production: ' + (qty != null ? Math.round(qty).toLocaleString('en-IN') : '0') + ' kg';
-              }
-            }
-          }
-        },
-        scales: {
-          x: { ticks: { autoSkip: false }, grid: { display: false } },
-          y: { title: { display: true, text: 'Rs / kg' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
-        }
-      }
-    });
-    return () => { if (chartRef.current) chartRef.current.destroy(); };
-  }, [months, rateDatasets, totalQtyByMonth]);
-
-  if (!rateDatasets.length) {
-    return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No monthly trend data yet.</div>;
-  }
-  if (months.length < 2) {
-    return (
-      <div>
-        <div style={{ fontSize: 13, color: 'var(--ink-2)', marginBottom: 8 }}>
-          Only one month of data uploaded so far ({monthKeyToLabel(months[0])}) — the trend will build up as more months come in.
-        </div>
-        <div style={{ position: 'relative', height: 240 }}>
-          <ChartResetButton chartRef={chartRef} />
-          <canvas ref={canvasRef} role="img" aria-label="Line chart of Rs per kg cost by month, one line per alloy"></canvas>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div style={{ position: 'relative', height: 280 }}>
-      <ChartResetButton chartRef={chartRef} />
-      <canvas ref={canvasRef} role="img" aria-label="Line chart of Rs per kg cost by month, one line per alloy. Hover a point for qty and total production. Scroll to zoom, drag to pan."></canvas>
-    </div>
-  );
-}
-
 function BatchCostChart({ rows, title }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
@@ -1606,8 +1353,10 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, o
                 const isMono = isName && view === 'batch';
                 const isRateCol = key === 'rate' || key.endsWith('Rate');
                 const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
+                const isDateCol = key === 'date';
                 let val;
-                if (isRateCol) val = fmtRate(r[key]);
+                if (isDateCol) val = keyToLabel(r[key]);
+                else if (isRateCol) val = fmtRate(r[key]);
                 else if (isTextCol) val = r[key] || '-';
                 else val = fmt(r[key]);
 
