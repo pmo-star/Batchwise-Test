@@ -104,6 +104,14 @@ const GROUP_MAP = {
 };
 const DEPARTMENTS = ['CCP / Mill', 'Coin', 'Coil', 'Cup', 'Case'];
 
+// the three combined (Direct + Indirect) cost categories that get their own
+// trend chart in every view, in addition to the overall Total trend/chart
+const METRIC_CONFIGS = [
+  { key: 'store', label: 'Store', fields: ['storeD', 'storeI'], batchKey: 'storeTotalRate' },
+  { key: 'power', label: 'Power', fields: ['powerD', 'powerI'], batchKey: 'powerTotalRate' },
+  { key: 'labour', label: 'Labour', fields: ['labD', 'labI'], batchKey: 'labTotalRate' }
+];
+
 /* ============================================================
    STORAGE (Google Sheet backend, in-memory cache)
    Batch data is stored as real sheet rows (not one giant JSON
@@ -420,7 +428,11 @@ function aggregateBy(rows, keyFn, nameFn) {
       labDRate: b.qty ? b.labD / b.qty : 0,
       labIRate: b.qty ? b.labI / b.qty : 0,
       powerDRate: b.qty ? b.powerD / b.qty : 0,
-      powerIRate: b.qty ? b.powerI / b.qty : 0
+      powerIRate: b.qty ? b.powerI / b.qty : 0,
+      // combined Direct + Indirect, one column each for Store/Labour/Power
+      storeTotalRate: b.qty ? (b.storeD + b.storeI) / b.qty : 0,
+      labTotalRate: b.qty ? (b.labD + b.labI) / b.qty : 0,
+      powerTotalRate: b.qty ? (b.powerD + b.powerI) / b.qty : 0
     }))
     .sort((a, b) => b.qty - a.qty);
 }
@@ -476,6 +488,8 @@ function App() {
   const [sortKey, setSortKey] = useState(null);
   const [sortDir, setSortDir] = useState('desc');
   const [search, setSearch] = useState('');
+  const [selectedMachine, setSelectedMachine] = useState('');
+  const [selectedBatch, setSelectedBatch] = useState('');
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
@@ -575,6 +589,35 @@ function App() {
   const deptRows = useMemo(() => (rows || []).filter(r => r.dept === department), [rows, department]);
   const hasBatch = useMemo(() => deptRows.some(r => r.batch), [deptRows]);
 
+  // machine names available right now (current department + date range),
+  // used to populate the Machine filter dropdown next to the view tabs
+  const machineOptions = useMemo(() => {
+    const totals = {};
+    const display = {};
+    deptRows.forEach(r => {
+      if (!r.wc) return;
+      const key = normKey(r.wc);
+      totals[key] = (totals[key] || 0) + r.qty;
+      if (!display[key]) display[key] = normKey(r.wc);
+    });
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).map(k => display[k]);
+  }, [deptRows]);
+
+  // batch numbers available right now (current department + date range) —
+  // narrowed to the currently selected machine, if one is picked in the
+  // Machine dropdown, so the Batch list only shows batches that actually
+  // ran on that machine instead of every batch in the department.
+  const batchOptions = useMemo(() => {
+    const normM = selectedMachine ? normKey(selectedMachine) : null;
+    const totals = {};
+    deptRows.forEach(r => {
+      if (!r.batch) return;
+      if (normM && normKey(r.wc) !== normM) return;
+      totals[r.batch] = (totals[r.batch] || 0) + r.qty;
+    });
+    return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
+  }, [deptRows, selectedMachine]);
+
   const alloyOptions = useMemo(() => {
     const totals = {};
     deptRows.forEach(r => {
@@ -586,14 +629,24 @@ function App() {
 
   const searchedAllRows = useMemo(() => {
     if (!allRows) return allRows;
-    if (!search.trim()) return allRows;
-    const q = search.trim().toLowerCase();
-    return allRows.filter(r =>
-      (r.mat || '').toLowerCase().includes(q) ||
-      (r.wc || '').toLowerCase().includes(q) ||
-      (r.matCode || '').toLowerCase().includes(q)
-    );
-  }, [allRows, search]);
+    let result = allRows;
+    if (selectedMachine) {
+      const normM = normKey(selectedMachine);
+      result = result.filter(r => normKey(r.wc || '') === normM);
+    }
+    if (selectedBatch) {
+      result = result.filter(r => r.batch === selectedBatch);
+    }
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      result = result.filter(r =>
+        (r.mat || '').toLowerCase().includes(q) ||
+        (r.wc || '').toLowerCase().includes(q) ||
+        (r.matCode || '').toLowerCase().includes(q)
+      );
+    }
+    return result;
+  }, [allRows, search, selectedMachine, selectedBatch]);
 
   const allTimeAlloyOptions = useMemo(() => {
     if (!searchedAllRows) return [];
@@ -630,6 +683,20 @@ function App() {
     setSortDir('desc');
   }, [view]);
 
+  // a machine/alloy/batch picked in one department won't exist in another,
+  // so switching departments clears whatever filter was active
+  useEffect(() => {
+    setSearch('');
+    setSelectedMachine('');
+    setSelectedBatch('');
+  }, [department]);
+
+  // if the selected batch doesn't belong to the newly-selected machine,
+  // drop it rather than silently filtering everything down to nothing
+  useEffect(() => {
+    if (selectedBatch && !batchOptions.includes(selectedBatch)) setSelectedBatch('');
+  }, [batchOptions, selectedBatch]);
+
   const aggregated = useMemo(() => {
     if (view === 'wc') return aggregateBy(deptRows, r => r.date + '||' + normKey(r.wc), r => normKey(r.wc));
     if (view === 'alloy') return aggregateBy(
@@ -652,14 +719,24 @@ function App() {
   }, [deptRows, view]);
 
   const filtered = useMemo(() => {
-    if (!search.trim()) return aggregated;
-    const q = search.trim().toLowerCase();
-    return aggregated.filter(r =>
-      r.name.toLowerCase().includes(q) ||
-      (r.wc || '').toLowerCase().includes(q) ||
-      (r.matCode || '').toLowerCase().includes(q)
-    );
-  }, [aggregated, search]);
+    let result = aggregated;
+    if (selectedMachine) {
+      const normM = normKey(selectedMachine);
+      result = result.filter(r => normKey(r.wc || '') === normM);
+    }
+    if (selectedBatch && view === 'batch') {
+      result = result.filter(r => r.name === selectedBatch);
+    }
+    if (search.trim()) {
+      const q = search.trim().toLowerCase();
+      result = result.filter(r =>
+        r.name.toLowerCase().includes(q) ||
+        (r.wc || '').toLowerCase().includes(q) ||
+        (r.matCode || '').toLowerCase().includes(q)
+      );
+    }
+    return result;
+  }, [aggregated, search, selectedMachine, selectedBatch, view]);
 
   const sortedFiltered = useMemo(() => {
     if (!sortKey) return filtered;
@@ -724,6 +801,8 @@ function App() {
   }, [filtered]);
 
   const activeFilters = [];
+  if (selectedMachine) activeFilters.push({ key: 'machine', label: 'Machine: "' + selectedMachine + '"', clear: () => setSelectedMachine('') });
+  if (selectedBatch) activeFilters.push({ key: 'batch', label: 'Batch: "' + selectedBatch + '"', clear: () => setSelectedBatch('') });
   if (search.trim()) activeFilters.push({ key: 'search', label: 'Search: "' + search.trim() + '"', clear: () => setSearch('') });
 
   const fmt = n => Math.round(n).toLocaleString('en-IN');
@@ -732,7 +811,7 @@ function App() {
   const COLS_AGG = [
     ['date', 'Date', 'left'],
     ['name', view === 'batch' ? 'Batch' : view === 'wc' ? 'Machine' : view === 'alloy' ? 'Material' : 'Name', 'left'],
-    ...(view === 'batch' ? [['wc', 'Work center', 'left'], ['matCode', 'Material code', 'left']] : []),
+    ...(view === 'batch' ? [['wc', 'Machine', 'left'], ['matCode', 'Material code', 'left']] : []),
     ...(view === 'alloy' ? [['wc', 'Machine', 'left']] : []),
     ...(view === 'wc' ? [['count', 'Batch', 'right']] : []),
     ['qty', 'Qty (kg)', 'right'],
@@ -742,6 +821,9 @@ function App() {
     ['labIRate', 'Labour indirect (Rs/kg)', 'right'],
     ['powerDRate', 'Power direct (Rs/kg)', 'right'],
     ['powerIRate', 'Power indirect (Rs/kg)', 'right'],
+    ['storeTotalRate', 'Total Store (Rs/kg)', 'right'],
+    ['labTotalRate', 'Total Labour (Rs/kg)', 'right'],
+    ['powerTotalRate', 'Total Power (Rs/kg)', 'right'],
     ['rate', 'Total (Rs/kg)', 'right']
   ];
 
@@ -765,6 +847,9 @@ function App() {
           dateIndex={dateIndex} fromDate={fromDate} setFromDate={setFromDate} toDate={toDate} setToDate={setToDate}
           department={department} setDepartment={setDepartment}
           view={view} setView={setView} hasBatch={hasBatch}
+          machineOptions={machineOptions} batchOptions={batchOptions}
+          selectedMachine={selectedMachine} setSelectedMachine={setSelectedMachine}
+          selectedBatch={selectedBatch} setSelectedBatch={setSelectedBatch}
         />
 
         {activeFilters.length > 0 && (
@@ -781,13 +866,28 @@ function App() {
           <StatRow qty={totals.qty} total={totals.total} entries={totals.count} fmt={fmt} />
         )}
 
+        {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && METRIC_CONFIGS.map(m => (
+          <div key={m.key} style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>{m.label} cost per kg over time — by alloy</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume)</span>
+            </div>
+            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
+              groupField="mat" fromDate={fromDate} toDate={toDate} metricFields={m.fields}
+              ariaLabel={m.label + ' cost per kg over time, one line per alloy.'} />
+          </div>
+        ))}
+
         {!loading && !error && view === 'alloy' && allTimeAlloyOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg over time — by alloy</span>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>Total cost per kg over time — by alloy</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all machines combined, {department} — top 10 alloys by volume — hover a point for qty too)</span>
             </div>
             <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeAlloyOptions}
@@ -796,18 +896,60 @@ function App() {
           </div>
         )}
 
+        {!loading && !error && view === 'wc' && allTimeMachineOptions.length > 0 && METRIC_CONFIGS.map(m => (
+          <div key={m.key} style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>{m.label} cost per kg over time — by machine</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all alloys combined per machine, {department} — top 10 machines by volume)</span>
+            </div>
+            <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
+              groupField="wc" fromDate={fromDate} toDate={toDate} metricFields={m.fields}
+              ariaLabel={m.label + ' cost per kg over time, one line per machine.'} />
+          </div>
+        ))}
+
         {!loading && !error && view === 'wc' && allTimeMachineOptions.length > 0 && (
           <div style={{
             background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
             padding: '16px 16px 8px', marginBottom: 16
           }}>
             <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
-              <span style={{ fontSize: 13, fontWeight: 600, color: 'var(--ink-2)' }}>Cost per kg over time — by machine</span>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>Total cost per kg over time — by machine</span>
               <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>(all alloys combined per machine, {department} — top 10 machines by volume — hover a point for qty too)</span>
             </div>
             <AlloyTrendChart allRows={searchedAllRows} department={department} alloys={allTimeMachineOptions}
               groupField="wc" fromDate={fromDate} toDate={toDate}
               ariaLabel="Line chart of Rs per kg cost over time, one line per machine. Hover a point to see quantity." />
+          </div>
+        )}
+
+        {!loading && !error && view === 'batch' && sortedFiltered.length > 0 && METRIC_CONFIGS.map(m => (
+          <div key={m.key} style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>{m.label} cost per kg by batch</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>({department}, this selection — top 25 shown, hover a bar for qty)</span>
+            </div>
+            <BatchRateBarChart rows={sortedFiltered} metricKey={m.batchKey}
+              ariaLabel={m.label + ' cost per kg, one bar per batch.'} />
+          </div>
+        ))}
+
+        {!loading && !error && view === 'batch' && sortedFiltered.length > 0 && (
+          <div style={{
+            background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12,
+            padding: '16px 16px 8px', marginBottom: 16
+          }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <span style={{ fontSize: 16, fontWeight: 700, color: 'var(--accent)' }}>Total cost per kg by batch</span>
+              <span style={{ fontSize: 12, color: 'var(--ink-3)' }}>({department}, this selection — top 25 shown, hover a bar for qty)</span>
+            </div>
+            <BatchRateBarChart rows={sortedFiltered} />
           </div>
         )}
 
@@ -1032,7 +1174,7 @@ function DateRangeCalendarPicker({ dateIndex, fromDate, setFromDate, toDate, set
   );
 }
 
-function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, department, setDepartment, view, setView, hasBatch }) {
+function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, department, setDepartment, view, setView, hasBatch, machineOptions, batchOptions, selectedMachine, setSelectedMachine, selectedBatch, setSelectedBatch }) {
   return (
     <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 10, margin: '4px 0 18px' }}>
       <DateRangeCalendarPicker
@@ -1045,7 +1187,7 @@ function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, depart
       </select>
 
       <div style={{ display: 'flex', gap: 4, background: 'var(--surface-2)', border: '1px solid var(--line)', borderRadius: 8, padding: 3 }}>
-        {[['wc', 'Work center'], ['alloy', 'Alloy'], ['batch', 'Batch']].map(([k, label]) => {
+        {[['wc', 'Machine wise'], ['alloy', 'Alloy'], ['batch', 'Batch']].map(([k, label]) => {
           const disabled = k === 'batch' && !hasBatch;
           return (
             <button key={k} onClick={() => !disabled && setView(k)} disabled={disabled} className="focus-ring" style={{
@@ -1057,6 +1199,33 @@ function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, depart
           );
         })}
       </div>
+
+      {machineOptions && machineOptions.length > 0 && (
+        <select
+          value={selectedMachine}
+          onChange={e => setSelectedMachine(e.target.value)}
+          className="focus-ring"
+          style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 600 }}
+        >
+          <option value="">All machines</option>
+          {machineOptions.map(m => <option key={m} value={m}>{m}</option>)}
+        </select>
+      )}
+
+      {view === 'batch' && batchOptions && batchOptions.length > 0 && (
+        <select
+          value={selectedBatch}
+          onChange={e => {
+            setSelectedBatch(e.target.value);
+            if (e.target.value) setView('batch');
+          }}
+          className="focus-ring"
+          style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 600 }}
+        >
+          <option value="">All batches</option>
+          {batchOptions.map(b => <option key={b} value={b}>{b}</option>)}
+        </select>
+      )}
     </div>
   );
 }
@@ -1127,8 +1296,9 @@ function MultiValueCell({ value }) {
 ============================================================ */
 const TREND_LINE_COLORS = ['#B54E2E', '#2E6FBF', '#1E9E6B', '#D9A400', '#C0568A', '#6B4FBF', '#2AA198', '#C4453A', '#7A8B3F', '#8B5A2B'];
 
-function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate) {
+function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate, metricFields) {
   groupField = groupField || 'mat';
+  metricFields = metricFields || ['total'];
   if (!allRows || !groupValues.length) return { dates: [], rateDatasets: [], qtyDatasets: [], totalQtyByDate: {} };
   const canonicalByNormKey = {};
   groupValues.forEach(v => { canonicalByNormKey[normKey(v)] = v; });
@@ -1146,7 +1316,7 @@ function buildAlloyTrendData(allRows, department, groupValues, groupField, fromD
     const key = canonical + '||' + r.date;
     if (!byGroupDate[key]) byGroupDate[key] = { qty: 0, total: 0 };
     byGroupDate[key].qty += r.qty;
-    byGroupDate[key].total += r.total;
+    byGroupDate[key].total += metricFields.reduce((sum, f) => sum + (r[f] || 0), 0);
   });
   const dates = Array.from(dateSet).sort();
   const rateDatasets = groupValues.map((val, i) => ({
@@ -1176,13 +1346,13 @@ function buildAlloyTrendData(allRows, department, groupValues, groupField, fromD
   return { dates, rateDatasets, qtyDatasets, totalQtyByDate };
 }
 
-function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, toDate, ariaLabel }) {
+function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, toDate, ariaLabel, metricFields, yAxisLabel }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
 
   const { dates, rateDatasets, totalQtyByDate } = useMemo(
-    () => buildAlloyTrendData(allRows, department, alloys, groupField, fromDate, toDate),
-    [allRows, department, alloys, groupField, fromDate, toDate]
+    () => buildAlloyTrendData(allRows, department, alloys, groupField, fromDate, toDate, metricFields),
+    [allRows, department, alloys, groupField, fromDate, toDate, metricFields]
   );
 
   useEffect(() => {
@@ -1214,7 +1384,7 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
         },
         scales: {
           x: { ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
-          y: { title: { display: true, text: 'Rs / kg' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
+          y: { title: { display: true, text: yAxisLabel || 'Rs / kg' }, grid: { color: '#E7E2D8' }, beginAtZero: true }
         }
       }
     });
@@ -1235,6 +1405,64 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
       <div style={{ position: 'relative', height: 280 }}>
         <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Line chart of Rs per kg cost over time. Hover a point to see quantity."}></canvas>
       </div>
+    </div>
+  );
+}
+
+/* ============================================================
+   BATCH RATE BAR CHART (vertical bar: Batch on X axis,
+   Rs/kg on Y axis, for the current selection)
+============================================================ */
+function BatchRateBarChart({ rows, metricKey, yAxisLabel, ariaLabel }) {
+  const canvasRef = useRef(null);
+  const chartRef = useRef(null);
+  const key = metricKey || 'rate';
+  // cap so the chart stays readable — the table below already shows every row
+  const capped = useMemo(() => rows.slice(0, 25), [rows]);
+
+  useEffect(() => {
+    if (!canvasRef.current || typeof Chart === 'undefined') return;
+    if (chartRef.current) chartRef.current.destroy();
+    chartRef.current = new Chart(canvasRef.current, {
+      type: 'bar',
+      data: {
+        labels: capped.map(r => r.name),
+        datasets: [{
+          data: capped.map(r => r[key]),
+          backgroundColor: '#B54E2E',
+          borderRadius: 4,
+          barThickness: 20
+        }]
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+          legend: { display: false },
+          tooltip: {
+            callbacks: {
+              label: ctx => ctx.parsed.y.toFixed(2) + ' Rs/kg',
+              afterLabel: ctx => Math.round(capped[ctx.dataIndex].qty).toLocaleString('en-IN') + ' kg'
+            }
+          }
+        },
+        scales: {
+          x: { grid: { display: false }, ticks: { font: { size: 11 }, maxRotation: 45, autoSkip: false } },
+          y: { title: { display: true, text: yAxisLabel || 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } }
+        }
+      }
+    });
+    return () => { if (chartRef.current) chartRef.current.destroy(); };
+  }, [capped, key]);
+
+  if (!capped.length) {
+    return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No batch data yet.</div>;
+  }
+
+  return (
+    <div style={{ position: 'relative', height: 320 }}>
+      <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Bar chart of Rs per kg cost, one bar per batch. Batch numbers on the X axis, Rs per kg on the Y axis."}></canvas>
     </div>
   );
 }
