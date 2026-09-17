@@ -99,25 +99,17 @@ if (typeof pdfjsLib !== 'undefined') {
 const GOOGLE_SHEET_API_URL = 'https://script.google.com/macros/s/AKfycbzkfY8LRSrbi7gsWXYjXYnu_h5C31uPJibO2Nm7sDuNtF493GhTuI8JAj4uAVL5gUvh/exec';
 
 const GROUP_MAP = {
-  ZCCP: 'CCP / Mill', ZMILL: 'CCP / Mill', ZPULV: 'CCP / Mill', ZCH01: 'CCP / Mill',
+  ZCCP: 'CCP', ZMILL: 'CCP', ZPULV: 'CCP', ZCH01: 'CCP',
   ZCOIN: 'Coin', ZCL01: 'Coil', ZCUP: 'Cup', ZCASE: 'Case'
 };
-const DEPARTMENTS = ['CCP / Mill', 'Coin', 'Coil', 'Cup', 'Case'];
+const DEPARTMENTS = ['CCP', 'Coin', 'Coil', 'Cup', 'Case'];
 
-// the three combined (Direct + Indirect) cost categories that get their own
-// trend chart in every view, in addition to the overall Total trend/chart
 const METRIC_CONFIGS = [
   { key: 'store', label: 'Store', fields: ['storeD', 'storeI'], batchKey: 'storeTotalRate' },
   { key: 'power', label: 'Power', fields: ['powerD', 'powerI'], batchKey: 'powerTotalRate' },
   { key: 'labour', label: 'Labour', fields: ['labD', 'labI'], batchKey: 'labTotalRate' }
 ];
 
-/* ============================================================
-   STORAGE (Google Sheet backend, in-memory cache)
-   Batch data is stored as real sheet rows (not one giant JSON
-   blob per date) — a single Sheet cell caps out around 50,000
-   characters, which a few hundred batches can exceed easily.
-============================================================ */
 const cache = {};
 async function sheetGetMeta(key) {
   const cacheKey = 'meta:' + key;
@@ -166,9 +158,6 @@ async function setDayRows(dateKey, rows) {
   });
 }
 
-/* ============================================================
-   PARSING
-============================================================ */
 function normalizeHeader(h) {
   return String(h == null ? '' : h)
     .replace(/\u00A0/g, ' ')
@@ -235,6 +224,42 @@ function keyToLabel(key) {
   const [y, m, d] = key.split('-');
   const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
   return d + ' ' + months[parseInt(m, 10) - 1] + ' ' + y;
+}
+
+function parseDateTimeMs(val) {
+  if (val == null || val === '') return null;
+  if (typeof val === 'number' && isFinite(val)) {
+    return Date.UTC(1899, 11, 30) + val * 86400000;
+  }
+  if (val instanceof Date && !isNaN(val)) return val.getTime();
+  if (typeof val === 'string') {
+    const s = val.trim();
+    const m = s.match(/^(\d{4})-(\d{1,2})-(\d{1,2})[ T](\d{1,2}):(\d{1,2})(?::(\d{1,2}))?/);
+    if (m) {
+      return Date.UTC(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+    }
+    const d = new Date(s);
+    if (!isNaN(d)) return d.getTime();
+  }
+  return null;
+}
+
+function formatDateTime(ms) {
+  if (ms == null) return '-';
+  const d = new Date(ms);
+  const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+  const pad = n => String(n).padStart(2, '0');
+  return pad(d.getUTCDate()) + ' ' + months[d.getUTCMonth()] + ' ' + pad(d.getUTCHours()) + ':' + pad(d.getUTCMinutes()) + ':' + pad(d.getUTCSeconds());
+}
+
+function formatRunTime(minutes) {
+  if (minutes == null || !isFinite(Number(minutes))) return '-';
+  const totalSeconds = Math.max(0, Math.round(Number(minutes) * 60));
+  const hours = Math.floor(totalSeconds / 3600);
+  const mins = Math.floor((totalSeconds % 3600) / 60);
+  const secs = totalSeconds % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return pad(hours) + ':' + pad(mins) + ':' + pad(secs);
 }
 
 function normKey(s) {
@@ -310,6 +335,8 @@ async function parseWorkbook(arrayBuffer, isPdf) {
   const batchCol = findCol(headers, ['Batch']);
   const dateCol = findCol(headers, ['Posting Date'], ['posting', 'date']);
   const qtyCol = findCol(headers, ['Quantity', 'Qty'], ['qty'], ['unit']);
+  const startTimeCol = findCol(headers, ['Batch No. Start Time'], ['start', 'time'], ['end']);
+  const endTimeCol = findCol(headers, ['Batch No. End Time'], ['end', 'time'], ['start']);
 
   const storeDCols = findCostColumns(headers, 'Store Direct', 'storeD');
   const storeICols = findCostColumns(headers, 'Store Indirect', 'storeI');
@@ -350,6 +377,9 @@ async function parseWorkbook(arrayBuffer, isPdf) {
     const matCode = matCodeCol !== -1 ? (r[matCodeCol] || '').toString().trim() : '';
     const batch = batchCol !== -1 ? (r[batchCol] || '').toString().trim() : '';
     const qty = num(r[qtyCol]);
+    const startTime = startTimeCol !== -1 ? parseDateTimeMs(r[startTimeCol]) : null;
+    const endTime = endTimeCol !== -1 ? parseDateTimeMs(r[endTimeCol]) : null;
+    const runTime = (startTime != null && endTime != null) ? (endTime - startTime) / 60000 : null;
 
     const row = {
       dept,
@@ -358,6 +388,9 @@ async function parseWorkbook(arrayBuffer, isPdf) {
       matCode: matCode || null,
       batch: batch || null,
       qty,
+      startTime,
+      endTime,
+      runTime,
       storeD: costValue(r, storeDCols, qty),
       storeI: costValue(r, storeICols, qty),
       labD: costValue(r, labDCols, qty),
@@ -376,9 +409,6 @@ async function parseWorkbook(arrayBuffer, isPdf) {
   return byDate;
 }
 
-/* ============================================================
-   AGGREGATION
-============================================================ */
 function aggregateBy(rows, keyFn, nameFn) {
   const buckets = {};
 
@@ -390,6 +420,9 @@ function aggregateBy(rows, keyFn, nameFn) {
       buckets[k] = {
         name: nameFn ? nameFn(r) : k,
         date: r.date,
+        startTime: r.startTime != null ? r.startTime : null,
+        endTime: r.endTime != null ? r.endTime : null,
+        runTime: r.runTime != null ? r.runTime : null,
         count: 0,
         qty: 0,
         storeD: 0,
@@ -429,7 +462,6 @@ function aggregateBy(rows, keyFn, nameFn) {
       labIRate: b.qty ? b.labI / b.qty : 0,
       powerDRate: b.qty ? b.powerD / b.qty : 0,
       powerIRate: b.qty ? b.powerI / b.qty : 0,
-      // combined Direct + Indirect, one column each for Store/Labour/Power
       storeTotalRate: b.qty ? (b.storeD + b.storeI) / b.qty : 0,
       labTotalRate: b.qty ? (b.labD + b.labI) / b.qty : 0,
       powerTotalRate: b.qty ? (b.powerD + b.powerI) / b.qty : 0
@@ -437,9 +469,6 @@ function aggregateBy(rows, keyFn, nameFn) {
     .sort((a, b) => b.qty - a.qty);
 }
 
-/* ============================================================
-   SMALL UI PRIMITIVES
-============================================================ */
 function IconSearch() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>;
 }
@@ -475,15 +504,12 @@ function Chip({ label, onRemove }) {
   );
 }
 
-/* ============================================================
-   MAIN APP
-============================================================ */
 function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('bwt-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
   const [allRows, setAllRows] = useState(null);
   const [fromDate, setFromDate] = useState(null);
   const [toDate, setToDate] = useState(null);
-  const [department, setDepartment] = useState('CCP / Mill');
+  const [department, setDepartment] = useState('CCP');
   const [view, setView] = useState('wc');
   const [sortKey, setSortKey] = useState(null);
   const [sortDir, setSortDir] = useState('desc');
@@ -589,8 +615,6 @@ function App() {
   const deptRows = useMemo(() => (rows || []).filter(r => r.dept === department), [rows, department]);
   const hasBatch = useMemo(() => deptRows.some(r => r.batch), [deptRows]);
 
-  // machine names available right now (current department + date range),
-  // used to populate the Machine filter dropdown next to the view tabs
   const machineOptions = useMemo(() => {
     const totals = {};
     const display = {};
@@ -603,10 +627,6 @@ function App() {
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).map(k => display[k]);
   }, [deptRows]);
 
-  // batch numbers available right now (current department + date range) —
-  // narrowed to the currently selected machine, if one is picked in the
-  // Machine dropdown, so the Batch list only shows batches that actually
-  // ran on that machine instead of every batch in the department.
   const batchOptions = useMemo(() => {
     const normM = selectedMachine ? normKey(selectedMachine) : null;
     const totals = {};
@@ -627,6 +647,13 @@ function App() {
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
   }, [deptRows]);
 
+  // the Batch filter only makes sense while actually viewing the Batch tab
+  // — this is the one value used everywhere a "does the batch filter apply
+  // right now" check is needed, so switching to Machine wise/Alloy always
+  // behaves as if no batch were selected (search/stats/charts included),
+  // without losing the choice for whenever the user returns to Batch.
+  const effectiveSelectedBatch = view === 'batch' ? selectedBatch : '';
+
   const searchedAllRows = useMemo(() => {
     if (!allRows) return allRows;
     let result = allRows;
@@ -634,8 +661,8 @@ function App() {
       const normM = normKey(selectedMachine);
       result = result.filter(r => normKey(r.wc || '') === normM);
     }
-    if (selectedBatch) {
-      result = result.filter(r => r.batch === selectedBatch);
+    if (effectiveSelectedBatch) {
+      result = result.filter(r => r.batch === effectiveSelectedBatch);
     }
     if (search.trim()) {
       const q = search.trim().toLowerCase();
@@ -646,7 +673,7 @@ function App() {
       );
     }
     return result;
-  }, [allRows, search, selectedMachine, selectedBatch]);
+  }, [allRows, search, selectedMachine, effectiveSelectedBatch]);
 
   const allTimeAlloyOptions = useMemo(() => {
     if (!searchedAllRows) return [];
@@ -683,16 +710,12 @@ function App() {
     setSortDir('desc');
   }, [view]);
 
-  // a machine/alloy/batch picked in one department won't exist in another,
-  // so switching departments clears whatever filter was active
   useEffect(() => {
     setSearch('');
     setSelectedMachine('');
     setSelectedBatch('');
   }, [department]);
 
-  // if the selected batch doesn't belong to the newly-selected machine,
-  // drop it rather than silently filtering everything down to nothing
   useEffect(() => {
     if (selectedBatch && !batchOptions.includes(selectedBatch)) setSelectedBatch('');
   }, [batchOptions, selectedBatch]);
@@ -724,8 +747,8 @@ function App() {
       const normM = normKey(selectedMachine);
       result = result.filter(r => normKey(r.wc || '') === normM);
     }
-    if (selectedBatch && view === 'batch') {
-      result = result.filter(r => r.name === selectedBatch);
+    if (effectiveSelectedBatch) {
+      result = result.filter(r => r.name === effectiveSelectedBatch);
     }
     if (search.trim()) {
       const q = search.trim().toLowerCase();
@@ -736,7 +759,7 @@ function App() {
       );
     }
     return result;
-  }, [aggregated, search, selectedMachine, selectedBatch, view]);
+  }, [aggregated, search, selectedMachine, effectiveSelectedBatch]);
 
   const sortedFiltered = useMemo(() => {
     if (!sortKey) return filtered;
@@ -757,6 +780,17 @@ function App() {
     else { setSortKey(key); setSortDir('desc'); }
   }
 
+  // clicking a row's name should reuse the SAME filter the dropdowns use,
+  // not a separate free-text search — otherwise "Machine: X" (from the
+  // dropdown) and "Search: X" (from clicking the same machine's name in
+  // the table) show up as two redundant chips for one filter, and clearing
+  // one leaves the other still narrowing the data.
+  function handleNameClick(name) {
+    if (view === 'wc') setSelectedMachine(name);
+    else if (view === 'batch') setSelectedBatch(name);
+    else setSearch(name);
+  }
+
   function handleExportCsv() {
     if (!sortedFiltered.length) return;
     const headers = COLS_AGG.map(([, label]) => label);
@@ -766,8 +800,12 @@ function App() {
         const isRateCol = key === 'rate' || key.endsWith('Rate');
         const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
         const isDateCol = key === 'date';
+        const isTimeCol = key === 'startTime' || key === 'endTime';
+        const isRunTimeCol = key === 'runTime';
         let val;
         if (isDateCol) val = keyToLabel(r[key]);
+        else if (isTimeCol) val = formatDateTime(r[key]);
+        else if (isRunTimeCol) val = formatRunTime(r[key]);
         else if (isRateCol) val = r[key].toFixed(2);
         else if (isTextCol) val = r[key] || '';
         else val = Math.round(r[key]);
@@ -802,7 +840,7 @@ function App() {
 
   const activeFilters = [];
   if (selectedMachine) activeFilters.push({ key: 'machine', label: 'Machine: "' + selectedMachine + '"', clear: () => setSelectedMachine('') });
-  if (selectedBatch) activeFilters.push({ key: 'batch', label: 'Batch: "' + selectedBatch + '"', clear: () => setSelectedBatch('') });
+  if (view === 'batch' && selectedBatch) activeFilters.push({ key: 'batch', label: 'Batch: "' + selectedBatch + '"', clear: () => setSelectedBatch('') });
   if (search.trim()) activeFilters.push({ key: 'search', label: 'Search: "' + search.trim() + '"', clear: () => setSearch('') });
 
   const fmt = n => Math.round(n).toLocaleString('en-IN');
@@ -815,6 +853,11 @@ function App() {
     ...(view === 'alloy' ? [['wc', 'Machine', 'left']] : []),
     ...(view === 'wc' ? [['count', 'Batch', 'right']] : []),
     ['qty', 'Qty (kg)', 'right'],
+    ...(view === 'batch' ? [
+      ['startTime', 'Start Time', 'left'],
+      ['endTime', 'End Time', 'left'],
+      ['runTime', 'Run Time (HH:MM:SS)', 'right']
+    ] : []),
     ['storeDRate', 'Store direct (Rs/kg)', 'right'],
     ['storeIRate', 'Store indirect (Rs/kg)', 'right'],
     ['labDRate', 'Labour direct (Rs/kg)', 'right'],
@@ -974,7 +1017,7 @@ function App() {
             />
           ) : (
             <DataTable cols={COLS_AGG} rows={sortedFiltered} fmt={fmt} fmtRate={fmtRate} view={view}
-              sortKey={sortKey} sortDir={sortDir} onSort={handleSort} onNameClick={setSearch} />
+              sortKey={sortKey} sortDir={sortDir} onSort={handleSort} onNameClick={handleNameClick} />
           )}
         </div>
       </main>
@@ -991,9 +1034,6 @@ function App() {
   );
 }
 
-/* ============================================================
-   TOP BAR
-============================================================ */
 function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress }) {
   return (
     <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
@@ -1057,9 +1097,6 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
   );
 }
 
-/* ============================================================
-   FILTER BAR
-============================================================ */
 const MONTH_NAMES_FULL = ['January','February','March','April','May','June','July','August','September','October','November','December'];
 
 function DateRangeCalendarPicker({ dateIndex, fromDate, setFromDate, toDate, setToDate }) {
@@ -1230,9 +1267,6 @@ function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, depart
   );
 }
 
-/* ============================================================
-   STAT ROW
-============================================================ */
 function StatRow({ qty, total, entries, fmt }) {
   const cards = [
     ['Total qty', fmt(qty) + ' kg'],
@@ -1250,9 +1284,6 @@ function StatRow({ qty, total, entries, fmt }) {
   );
 }
 
-/* ============================================================
-   MULTI-VALUE CELL (click to expand into chips)
-============================================================ */
 function MultiValueCell({ value }) {
   const [expanded, setExpanded] = useState(false);
   if (!value || value === '-' || !value.includes(', ')) {
@@ -1287,13 +1318,6 @@ function MultiValueCell({ value }) {
   );
 }
 
-/* ============================================================
-   BATCH COST CHART (Rs/kg per batch, line chart)
-============================================================ */
-
-/* ============================================================
-   ALLOY TREND CHART
-============================================================ */
 const TREND_LINE_COLORS = ['#B54E2E', '#2E6FBF', '#1E9E6B', '#D9A400', '#C0568A', '#6B4FBF', '#2AA198', '#C4453A', '#7A8B3F', '#8B5A2B'];
 
 function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate, metricFields) {
@@ -1409,15 +1433,10 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
   );
 }
 
-/* ============================================================
-   BATCH RATE BAR CHART (vertical bar: Batch on X axis,
-   Rs/kg on Y axis, for the current selection)
-============================================================ */
 function BatchRateBarChart({ rows, metricKey, yAxisLabel, ariaLabel }) {
   const canvasRef = useRef(null);
   const chartRef = useRef(null);
   const key = metricKey || 'rate';
-  // cap so the chart stays readable — the table below already shows every row
   const capped = useMemo(() => rows.slice(0, 25), [rows]);
 
   useEffect(() => {
@@ -1519,9 +1538,6 @@ function BatchCostChart({ rows, title }) {
   );
 }
 
-/* ============================================================
-   DATA TABLE
-============================================================ */
 function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, onNameClick }) {
   return (
     <div style={{ overflowX: 'auto' }}>
@@ -1554,8 +1570,12 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, o
                 const isRateCol = key === 'rate' || key.endsWith('Rate');
                 const isTextCol = key === 'name' || key === 'wc' || key === 'material' || key === 'matCode';
                 const isDateCol = key === 'date';
+                const isTimeCol = key === 'startTime' || key === 'endTime';
+                const isRunTimeCol = key === 'runTime';
                 let val;
                 if (isDateCol) val = keyToLabel(r[key]);
+                else if (isTimeCol) val = formatDateTime(r[key]);
+                else if (isRunTimeCol) val = formatRunTime(r[key]);
                 else if (isRateCol) val = fmtRate(r[key]);
                 else if (isTextCol) val = r[key] || '-';
                 else val = fmt(r[key]);
@@ -1594,9 +1614,6 @@ function DataTable({ cols, rows, fmt, fmtRate, view, sortKey, sortDir, onSort, o
   );
 }
 
-/* ============================================================
-   STATES
-============================================================ */
 function LoadingState() {
   return (
     <div style={{ padding: '64px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, color: 'var(--ink-2)' }}>
