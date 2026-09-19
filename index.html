@@ -282,6 +282,7 @@ async function extractRowsFromPdf(arrayBuffer) {
 
   const dataRows = [];
   let headerRow = null;
+  let headerX = null; // x-position of each header cell — used as column boundaries
 
   for (let p = 1; p <= pdf.numPages; p++) {
     const page = await pdf.getPage(p);
@@ -297,13 +298,38 @@ async function extractRowsFromPdf(arrayBuffer) {
 
     const sortedYs = Object.keys(rowMap).map(Number).sort((a, b) => b - a);
     sortedYs.forEach(y => {
-      const cells = rowMap[y].sort((a, b) => a.x - b.x).map(c => c.str);
-      if (cells.length < 10) return;
-      if (cells[0] === 'Company Code') {
-        if (!headerRow) headerRow = cells;
+      const items = rowMap[y].sort((a, b) => a.x - b.x);
+      if (items.length < 10) return;
+
+      if (items[0].str === 'Company Code') {
+        if (!headerRow) {
+          headerRow = items.map(it => it.str);
+          headerX = items.map(it => it.x);
+        }
         return;
       }
-      dataRows.push(cells);
+
+      if (headerX) {
+        // Some SAP exports leave a cell blank (e.g. Batch Confirm Qty for a
+        // DROSS/recovery batch) — pdf.js then emits no text item at all for
+        // that position. Reading data rows by plain left-to-right token
+        // order would silently shift every later column back by one for
+        // that row. Bucketing each token by which header column's x-range
+        // it actually falls into keeps a blank cell blank instead, so every
+        // later value — Start/End Time included — lands in the right place.
+        const buckets = headerX.map(() => []);
+        items.forEach(it => {
+          let col = 0;
+          for (let i = 0; i < headerX.length; i++) {
+            if (headerX[i] <= it.x + 3) col = i;
+          }
+          buckets[col].push(it.str);
+        });
+        dataRows.push(buckets.map(b => b.join(' ').trim()));
+      } else {
+        // header not captured yet on this page — fall back to plain order
+        dataRows.push(items.map(it => it.str));
+      }
     });
   }
 
