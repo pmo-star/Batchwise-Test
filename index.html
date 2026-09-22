@@ -85,6 +85,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
 
 <script type="text/babel-jsx" id="app-source">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
@@ -98,6 +99,23 @@ if (typeof pdfjsLib !== 'undefined') {
 ============================================================ */
 const GOOGLE_SHEET_API_URL = 'https://script.google.com/macros/s/AKfycbzkfY8LRSrbi7gsWXYjXYnu_h5C31uPJibO2Nm7sDuNtF493GhTuI8JAj4uAVL5gUvh/exec';
 
+/* ============================================================
+   FIREBASE (replaces the old Google-Sheet-via-Apps-Script
+   transport for the tracker's own batch data + settings meta).
+   The Apps Script backend above is still used for ONE thing:
+   reading the separate monthly "Plan vs Actual" Google Sheet
+   (fetchPlanSheetCsv / action=getPlanRows), since Firestore can't
+   read a Google Sheet directly.
+============================================================ */
+const firebaseConfig = {
+  apiKey: "AIzaSyDX1AunKy4e5QOTmvEiKCJv9K9SxSUFhxs",
+  authDomain: "batchwise-trends.firebaseapp.com",
+  projectId: "batchwise-trends",
+  storageBucket: "batchwise-trends.firebasestorage.app",
+  messagingSenderId: "860012761430",
+  appId: "1:860012761430:web:fd594b857ed13f167e06f7"
+};
+
 const GROUP_MAP = {
   ZCCP: 'CCP', ZMILL: 'CCP', ZPULV: 'CCP', ZCH01: 'CCP',
   ZCOIN: 'Coin', ZCL01: 'Coil', ZCUP: 'Cup', ZCASE: 'Case'
@@ -110,52 +128,205 @@ const METRIC_CONFIGS = [
   { key: 'labour', label: 'Labour', fields: ['labD', 'labI'], batchKey: 'labTotalRate' }
 ];
 
+/* ============================================================
+   PLAN vs ACTUAL (live Google Sheet)
+   Both the sheet ID and the month suffix are user-editable inside
+   the Plan vs Actual modal (gear icon) and stored in the same
+   backend meta store as everything else — because a NEW Google
+   Sheet gets created every month (not just a new tab), so there
+   is no fixed ID that stays correct on its own. These two
+   constants are only the fallback used the very first time,
+   before anyone has saved a value.
+============================================================ */
+const PLAN_SHEET_ID_DEFAULT = '1npeP0RAHDB-L0ivQwT2hxo4NJMygS7jylWIX5wTmVtk';
+const PLAN_MONTH_SUFFIX_DEFAULT = 'Sep';
+
+function buildPlanTabs(monthSuffix) {
+  const suf = monthSuffix || PLAN_MONTH_SUFFIX_DEFAULT;
+  return [
+    { key: 'ccp', label: 'CCP Plan', sheetName: 'CCP Plan vs Actual ' + suf },
+    { key: 'coil', label: 'Coil Transfer Plan', sheetName: 'Coil Transfer Plan vs Actual ' + suf },
+    { key: 'fg', label: 'FG Packing', sheetName: 'FG Packing Plan vs Actual ' + suf }
+  ];
+}
+
+// Accepts either a bare Sheet ID or a full Google Sheets URL and returns the ID
+function extractSheetId(input) {
+  const s = (input || '').trim();
+  const m = s.match(/\/d\/([a-zA-Z0-9_-]+)/);
+  if (m) return m[1];
+  if (/^[a-zA-Z0-9_-]{20,}$/.test(s)) return s; // looks like a bare ID already
+  return null;
+}
+
+/* ============================================================
+   FIRESTORE TRANSPORT LAYER — plain REST, no Firebase SDK.
+   Google's own Firestore docs say every SDK read — even a single
+   one-shot .get() — runs as a "short-lived snapshot listener":
+   a polling-then-listen model built for real-time sync. We never
+   need real-time updates here, so that machinery is pure overhead
+   (it's what was making the page slow after the SDK migration).
+   The REST API instead does a plain point lookup over normal
+   HTTPS — no channel, no listener, no persistent connection — so
+   this bypasses the SDK (and its ~140KB of scripts) entirely.
+   One document per date in "batchRows" (its content is that
+   date's row array); getAllRowsRemote lists the whole collection
+   in one paginated REST call rather than one request per date.
+============================================================ */
+const FIRESTORE_BASE = 'https://firestore.googleapis.com/v1/projects/' + firebaseConfig.projectId + '/databases/(default)/documents';
+const FIRESTORE_KEY = firebaseConfig.apiKey;
 const cache = {};
+
+function toFirestoreValue(v) {
+  if (v === null || v === undefined) return { nullValue: null };
+  if (typeof v === 'boolean') return { booleanValue: v };
+  if (typeof v === 'number') return Number.isInteger(v) ? { integerValue: String(v) } : { doubleValue: v };
+  if (Array.isArray(v)) return { arrayValue: { values: v.map(toFirestoreValue) } };
+  if (typeof v === 'object') {
+    const fields = {};
+    Object.keys(v).forEach(k => { fields[k] = toFirestoreValue(v[k]); });
+    return { mapValue: { fields } };
+  }
+  return { stringValue: String(v) };
+}
+function fromFirestoreValue(fv) {
+  if (!fv) return null;
+  if ('nullValue' in fv) return null;
+  if ('booleanValue' in fv) return fv.booleanValue;
+  if ('integerValue' in fv) return Number(fv.integerValue);
+  if ('doubleValue' in fv) return fv.doubleValue;
+  if ('stringValue' in fv) return fv.stringValue;
+  if ('arrayValue' in fv) return (fv.arrayValue.values || []).map(fromFirestoreValue);
+  if ('mapValue' in fv) {
+    const out = {};
+    const fields = fv.mapValue.fields || {};
+    Object.keys(fields).forEach(k => { out[k] = fromFirestoreValue(fields[k]); });
+    return out;
+  }
+  return null;
+}
+function docFieldsToObject(doc) {
+  const out = {};
+  const fields = (doc && doc.fields) || {};
+  Object.keys(fields).forEach(k => { out[k] = fromFirestoreValue(fields[k]); });
+  return out;
+}
+
+async function firestoreGetDoc(path) {
+  const res = await fetch(FIRESTORE_BASE + '/' + path + '?key=' + FIRESTORE_KEY);
+  if (res.status === 404) return null;
+  if (!res.ok) throw new Error('Firestore read failed (HTTP ' + res.status + ').');
+  return docFieldsToObject(await res.json());
+}
+async function firestoreSetDoc(path, obj) {
+  const fields = {};
+  Object.keys(obj).forEach(k => { fields[k] = toFirestoreValue(obj[k]); });
+  const mask = Object.keys(obj).map(k => 'updateMask.fieldPaths=' + encodeURIComponent(k)).join('&');
+  const res = await fetch(FIRESTORE_BASE + '/' + path + '?key=' + FIRESTORE_KEY + '&' + mask, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ fields })
+  });
+  if (!res.ok) throw new Error('Firestore write failed (HTTP ' + res.status + ').');
+}
+async function firestoreDeleteDoc(path) {
+  const res = await fetch(FIRESTORE_BASE + '/' + path + '?key=' + FIRESTORE_KEY, { method: 'DELETE' });
+  if (!res.ok && res.status !== 404) throw new Error('Firestore delete failed (HTTP ' + res.status + ').');
+}
+async function firestoreListCollection(collection, maskFields) {
+  const out = [];
+  let pageToken = null;
+  const maskParam = maskFields ? maskFields.map(f => '&mask.fieldPaths=' + encodeURIComponent(f)).join('') : '';
+  do {
+    let url = FIRESTORE_BASE + '/' + collection + '?key=' + FIRESTORE_KEY + '&pageSize=300' + maskParam;
+    if (pageToken) url += '&pageToken=' + encodeURIComponent(pageToken);
+    const res = await fetch(url);
+    if (!res.ok) throw new Error('Firestore list failed (HTTP ' + res.status + ').');
+    const json = await res.json();
+    (json.documents || []).forEach(doc => {
+      out.push({ id: doc.name.split('/').pop(), data: docFieldsToObject(doc) });
+    });
+    pageToken = json.nextPageToken || null;
+  } while (pageToken);
+  return out;
+}
+
 async function sheetGetMeta(key) {
   const cacheKey = 'meta:' + key;
   if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
-  const res = await fetch(GOOGLE_SHEET_API_URL + '?key=' + encodeURIComponent(key));
-  const json = await res.json();
-  const val = json && json.value !== undefined ? json.value : null;
+  const data = await firestoreGetDoc('meta/' + encodeURIComponent(key));
+  const val = data && data.value !== undefined ? data.value : null;
   cache[cacheKey] = val;
   return val;
 }
 async function sheetSetMeta(key, value) {
   cache['meta:' + key] = value;
-  await fetch(GOOGLE_SHEET_API_URL, {
-    method: 'POST',
-    mode: 'no-cors',
-    body: JSON.stringify({ action: 'set', key, value })
-  });
+  await firestoreSetDoc('meta/' + encodeURIComponent(key), { value });
 }
-async function getDateIndex() {
-  const raw = await sheetGetMeta('v3-date-index');
-  try { return raw ? JSON.parse(raw) : []; } catch (e) { return []; }
-}
-async function setDateIndex(list) { await sheetSetMeta('v3-date-index', JSON.stringify(list)); }
 
-async function getAllRowsRemote() {
-  const res = await fetch(GOOGLE_SHEET_API_URL + '?action=getAllRows');
-  const json = await res.json();
-  return (json && json.rows) || [];
+// Rows for one date are stored as a SINGLE JSON string field (rowsJson),
+// not as a native Firestore array-of-maps. Firestore's typed REST format
+// tags every single field of every row (mapValue/fields/stringValue/...),
+// which roughly triples the transferred bytes for data shaped like ours
+// (many short fields, thousands of rows) — one plain JSON string avoids
+// that per-field tagging overhead entirely. Old documents written before
+// this change used a "rows" array field; that's read as a fallback so
+// nothing breaks before they're next re-uploaded or re-migrated.
+function decodeDayDoc(data) {
+  if (!data) return [];
+  if (data.rowsJson) { try { return JSON.parse(data.rowsJson); } catch (e) { return []; } }
+  return data.rows || [];
 }
 
 async function getDayRows(dateKey) {
   const cacheKey = 'rows:' + dateKey;
   if (Object.prototype.hasOwnProperty.call(cache, cacheKey)) return cache[cacheKey];
-  const res = await fetch(GOOGLE_SHEET_API_URL + '?action=getRows&date=' + encodeURIComponent(dateKey));
-  const json = await res.json();
-  const rows = (json && json.rows) || [];
+  const data = await firestoreGetDoc('batchRows/' + encodeURIComponent(dateKey));
+  const rows = decodeDayDoc(data);
   cache[cacheKey] = rows;
   return rows;
 }
 async function setDayRows(dateKey, rows) {
   cache['rows:' + dateKey] = rows;
-  await fetch(GOOGLE_SHEET_API_URL, {
-    method: 'POST',
-    mode: 'no-cors',
-    body: JSON.stringify({ action: 'setRows', date: dateKey, rows })
+  if (!rows || !rows.length) {
+    await firestoreDeleteDoc('batchRows/' + encodeURIComponent(dateKey));
+  } else {
+    await firestoreSetDoc('batchRows/' + encodeURIComponent(dateKey), { rowsJson: JSON.stringify(rows), updatedAt: Date.now() });
+  }
+}
+
+// Cheap: lists every date that has data WITHOUT downloading its (large)
+// row content — only the "updatedAt" field is requested via a field
+// mask, so this call stays tiny (a few KB) no matter how much historical
+// data exists, and the app can build the calendar picker / know the
+// latest date before paying for any of the actual row data.
+async function listAvailableDates() {
+  const docs = await firestoreListCollection('batchRows', ['updatedAt']);
+  return docs.map(d => d.id).sort();
+}
+
+// Fetches full row data for a specific set of dates (parallel one-shot
+// reads) — used to load just the dates actually needed right now
+// (usually one) rather than the entire history.
+async function getRowsForDates(dateKeys) {
+  const perDate = await Promise.all(dateKeys.map(d => getDayRows(d)));
+  const all = [];
+  dateKeys.forEach((d, i) => { (perDate[i] || []).forEach(r => all.push({ ...r, date: d })); });
+  return all;
+}
+
+// Full history in one paginated list call — used only for the
+// background fill-in (all-time alloy/machine rankings), never for the
+// initial paint, so it never blocks the page from becoming usable.
+async function getAllRowsRemote() {
+  const docs = await firestoreListCollection('batchRows');
+  const all = [];
+  docs.forEach(({ id, data }) => {
+    const rowsArr = decodeDayDoc(data);
+    cache['rows:' + id] = rowsArr;
+    rowsArr.forEach(r => all.push({ ...r, date: id }));
   });
+  return all;
 }
 
 function normalizeHeader(h) {
@@ -495,6 +666,223 @@ function aggregateBy(rows, keyFn, nameFn) {
     .sort((a, b) => b.qty - a.qty);
 }
 
+/* ============================================================
+   PLAN vs ACTUAL — fetch + parse
+   Fetched via the Apps Script backend (action=getPlanRows), so
+   the plan sheet never needs "anyone with the link" sharing —
+   only normal sharing with whichever Google account the script
+   runs as. Parsing is done by matching HEADER TEXT, not fixed
+   column positions.
+============================================================ */
+function parseCsvText(text) {
+  // minimal CSV parser: handles quoted fields, escaped quotes, commas/newlines inside quotes
+  const rows = [];
+  let row = [];
+  let field = '';
+  let inQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inQuotes) {
+      if (c === '"') {
+        if (text[i + 1] === '"') { field += '"'; i++; }
+        else inQuotes = false;
+      } else field += c;
+    } else if (c === '"') {
+      inQuotes = true;
+    } else if (c === ',') {
+      row.push(field); field = '';
+    } else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i + 1] === '\n') i++;
+      row.push(field); field = '';
+      rows.push(row); row = [];
+    } else {
+      field += c;
+    }
+  }
+  if (field !== '' || row.length) { row.push(field); rows.push(row); }
+  return rows;
+}
+
+async function fetchPlanSheetCsv(sheetId, sheetName) {
+  const url = GOOGLE_SHEET_API_URL + '?action=getPlanRows' +
+    '&sheetId=' + encodeURIComponent(sheetId) + '&tabName=' + encodeURIComponent(sheetName);
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Could not reach the backend (HTTP ' + res.status + ').');
+  const json = await res.json();
+  if (!json || json.success === false) {
+    throw new Error((json && json.error) || 'The backend could not read that plan sheet/tab.');
+  }
+  return json.rows || [];
+}
+
+// finds the "catch-up" summary table anywhere in the sheet by matching
+// header text (Product / Plan / Actual-or-Transferred / Shortfall /
+// Required-per-day) rather than a fixed row/column position
+function findCatchupHeaderRow(rows) {
+  for (let r = 0; r < rows.length; r++) {
+    const cells = rows[r].map(c => (c || '').toString().trim().toLowerCase());
+    const hasProduct = cells.some(c => c === 'product');
+    const hasPlan = cells.some(c => c.includes('plan'));
+    const hasActual = cells.some(c => c.includes('actual') || c.includes('transfer'));
+    const hasShortfall = cells.some(c => c.includes('shortfall'));
+    if (hasProduct && hasPlan && hasActual && hasShortfall) return r;
+  }
+  return -1;
+}
+
+function colIndexMatching(headerCells, predicate) {
+  for (let i = 0; i < headerCells.length; i++) {
+    if (predicate(headerCells[i])) return i;
+  }
+  return -1;
+}
+
+function parseNum(v) {
+  if (v == null || v === '') return null;
+  const n = parseFloat(String(v).replace(/,/g, ''));
+  return isFinite(n) ? n : null;
+}
+
+function parsePlanCatchup(rows) {
+  const headerIdx = findCatchupHeaderRow(rows);
+  if (headerIdx === -1) return { rows: [], total: null };
+
+  const header = rows[headerIdx].map(c => (c || '').toString().trim().toLowerCase());
+  const cProduct = colIndexMatching(header, c => c === 'product');
+  const cTotalPlan = colIndexMatching(header, c => c.includes('total') && c.includes('plan'));
+  const cPlanTillDate = colIndexMatching(header, c => c.includes('plan') && c.includes('till'));
+  const cActualTillDate = colIndexMatching(header, c => (c.includes('transfer') || c.includes('actual')) && c.includes('till'));
+  const cShortfallTillDate = colIndexMatching(header, c => c.includes('shortfall') && c.includes('till'));
+  const cTotalShortfall = colIndexMatching(header, c => c.includes('total') && c.includes('shortfall'));
+  const cRequiredPerDay = colIndexMatching(header, c => c.includes('required'));
+
+  if (cProduct === -1) return { rows: [], total: null };
+
+  const out = [];
+  let total = null;
+  for (let r = headerIdx + 1; r < rows.length; r++) {
+    const row = rows[r];
+    const name = (row[cProduct] || '').toString().trim();
+    if (!name) break; // blank row ends the table
+    const entry = {
+      name,
+      totalPlan: parseNum(row[cTotalPlan]),
+      planTillDate: parseNum(row[cPlanTillDate]),
+      actualTillDate: parseNum(row[cActualTillDate]),
+      shortfallTillDate: parseNum(row[cShortfallTillDate]),
+      totalShortfall: parseNum(row[cTotalShortfall]),
+      requiredPerDay: parseNum(row[cRequiredPerDay])
+    };
+    if (name.toLowerCase() === 'total' || name.toLowerCase() === 'g.total') {
+      total = entry;
+    } else {
+      out.push(entry);
+    }
+  }
+  return { rows: out, total };
+}
+
+/* ============================================================
+   PLAN vs ACTUAL — from a photo (OCR)
+   Tesseract reads individual words with their pixel position on
+   the image. Numbers OCR very reliably; header text often doesn't
+   (tight column spacing merges words together), so instead of
+   trying to match header labels, this assumes the catch-up
+   table's column ORDER is always: Product, Total Plan, Plan Till
+   Date, Actual Till Date, Shortfall Till Date, Total Shortfall,
+   Required/day — the same fixed layout every screenshot of this
+   table has — and reconstructs columns from word X-position,
+   the same bucketing idea used for the SAP PDF parser.
+============================================================ */
+function groupWordsIntoRows(words, yThreshold) {
+  const sorted = [...words].sort((a, b) => a.y0 - b.y0);
+  const rows = [];
+  sorted.forEach(w => {
+    const midY = (w.y0 + w.y1) / 2;
+    let row = rows.find(r => Math.abs(r.midY - midY) < yThreshold);
+    if (!row) { row = { midY, words: [] }; rows.push(row); }
+    row.words.push(w);
+    row.midY = row.words.reduce((s, ww) => s + (ww.y0 + ww.y1) / 2, 0) / row.words.length;
+  });
+  rows.sort((a, b) => a.midY - b.midY);
+  rows.forEach(r => r.words.sort((a, b) => a.x0 - b.x0));
+  return rows.map(r => r.words);
+}
+
+// a product name like "NS 20%" or "ALBR (COLUMBIA CORE)" OCRs as several
+// separate words that sit close together — merge words whose gap is small
+// relative to the text height into one cell, so they land in one column
+// bucket instead of being mistaken for several columns
+function mergeWordsIntoCells(rowWords) {
+  if (!rowWords.length) return [];
+  const avgHeight = rowWords.reduce((s, w) => s + (w.y1 - w.y0), 0) / rowWords.length;
+  const gapThreshold = Math.max(10, avgHeight * 0.9);
+  const cells = [];
+  rowWords.forEach(w => {
+    const last = cells[cells.length - 1];
+    if (last && (w.x0 - last.x1) < gapThreshold) {
+      last.text += ' ' + w.text;
+      last.x1 = Math.max(last.x1, w.x1);
+    } else {
+      cells.push({ text: w.text, x0: w.x0, x1: w.x1 });
+    }
+  });
+  return cells;
+}
+
+function bucketRowByColumns(rowCells, boundaries) {
+  const buckets = boundaries.map(() => []);
+  rowCells.forEach(c => {
+    let col = 0;
+    for (let i = 0; i < boundaries.length; i++) {
+      if (boundaries[i] <= c.x0 + 5) col = i;
+    }
+    buckets[col].push(c.text);
+  });
+  return buckets.map(b => b.join(' ').trim());
+}
+
+async function extractPlanTableFromImage(file, onProgress) {
+  const { data } = await Tesseract.recognize(file, 'eng', {
+    logger: m => { if (onProgress && m.status === 'recognizing text') onProgress(Math.round((m.progress || 0) * 100)); }
+  });
+  const words = (data.words || [])
+    .map(w => ({ text: w.text, x0: w.bbox.x0, x1: w.bbox.x1, y0: w.bbox.y0, y1: w.bbox.y1 }))
+    .filter(w => w.text.trim() !== '');
+  if (!words.length) throw new Error('Could not read any text from that image.');
+
+  const rows = groupWordsIntoRows(words, 14).map(mergeWordsIntoCells);
+  if (rows.length < 2) throw new Error('Could not detect a table (need a header row plus at least one data row).');
+
+  const dataRowCandidates = rows.slice(1);
+  let refRow = dataRowCandidates[0];
+  dataRowCandidates.forEach(r => { if (r.length > refRow.length) refRow = r; });
+  const boundaries = refRow.map(c => c.x0);
+
+  return dataRowCandidates.map(r => bucketRowByColumns(r, boundaries));
+}
+
+function fixedColumnsToEntries(dataRows) {
+  const out = [];
+  let total = null;
+  dataRows.forEach(row => {
+    const name = (row[0] || '').toString().trim();
+    if (!name) return;
+    const entry = {
+      name,
+      totalPlan: parseNum(row[1]),
+      planTillDate: parseNum(row[2]),
+      actualTillDate: parseNum(row[3]),
+      shortfallTillDate: parseNum(row[4]),
+      totalShortfall: parseNum(row[5]),
+      requiredPerDay: parseNum(row[6])
+    };
+    if (name.toLowerCase() === 'total' || name.toLowerCase() === 'g.total') total = entry;
+    else out.push(entry);
+  });
+  return { rows: out, total };
+}
+
 function IconSearch() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>;
 }
@@ -512,6 +900,12 @@ function IconMoon() {
 }
 function IconSun() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></svg>;
+}
+function IconPlan() {
+  return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 3v18h18"/><path d="M18 17V9"/><path d="M13 17V5"/><path d="M8 17v-3"/></svg>;
+}
+function IconGear() {
+  return <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>;
 }
 
 function Chip({ label, onRemove }) {
@@ -532,6 +926,8 @@ function Chip({ label, onRemove }) {
 
 function App() {
   const [theme, setTheme] = useState(() => localStorage.getItem('bwt-theme') || (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'));
+  const [availableDates, setAvailableDates] = useState([]);
+  const [historyLoading, setHistoryLoading] = useState(false);
   const [allRows, setAllRows] = useState(null);
   const [fromDate, setFromDate] = useState(null);
   const [toDate, setToDate] = useState(null);
@@ -542,7 +938,17 @@ function App() {
   const [search, setSearch] = useState('');
   const [selectedMachine, setSelectedMachine] = useState('');
   const [selectedBatch, setSelectedBatch] = useState('');
+  const [showPlanModal, setShowPlanModal] = useState(false);
+  const [planTabKey, setPlanTabKey] = useState('ccp');
+  const [planLoading, setPlanLoading] = useState(false);
+  const [planError, setPlanError] = useState(null);
+  const [planData, setPlanData] = useState(null);
+  const [planSheetId, setPlanSheetId] = useState(PLAN_SHEET_ID_DEFAULT);
+  const [planMonthSuffix, setPlanMonthSuffix] = useState(PLAN_MONTH_SUFFIX_DEFAULT);
+  const [planSettingsLoaded, setPlanSettingsLoaded] = useState(false);
+  const [planDataSavedAt, setPlanDataSavedAt] = useState(null);
   const [loading, setLoading] = useState(true);
+  const [loadElapsedMs, setLoadElapsedMs] = useState(null);
   const [error, setError] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [toast, setToast] = useState(null);
@@ -558,27 +964,148 @@ function App() {
     setTimeout(() => setToast(t => (t && t.msg === msg ? null : t)), isError ? 5000 : 3000);
   }, []);
 
-  const dateIndex = useMemo(() => {
-    if (!allRows) return [];
-    return Array.from(new Set(allRows.map(r => r.date))).sort().reverse();
-  }, [allRows]);
+  // The calendar/date picker uses the full list of dates that have data
+  // (cheap to fetch — see listAvailableDates), not whatever happens to be
+  // loaded into allRows yet, so it shows every real date immediately even
+  // while the background history fill below is still in progress.
+  const dateIndex = availableDates;
 
   const loadAll = useCallback(async () => {
-    setLoading(true); setError(null);
+    setLoading(true); setError(null); setLoadElapsedMs(null);
+    const startedAt = performance.now();
     try {
-      const rows = await getAllRowsRemote();
-      setAllRows(rows);
-      const dates = Array.from(new Set(rows.map(r => r.date))).sort().reverse();
-      setFromDate(prev => (prev && dates.includes(prev)) ? prev : (dates[0] || null));
-      setToDate(prev => (prev && dates.includes(prev)) ? prev : (dates[0] || null));
+      const datesAsc = await listAvailableDates();
+      const datesDesc = datesAsc.slice().reverse();
+      setAvailableDates(datesDesc);
+      const latest = datesDesc[0] || null;
+      setFromDate(prev => (prev && datesAsc.includes(prev)) ? prev : latest);
+      setToDate(prev => (prev && datesAsc.includes(prev)) ? prev : latest);
+
+      // Fast phase: only fetch the one date actually needed for the
+      // default view, so the page becomes usable almost immediately
+      // instead of waiting for every historical date to download.
+      const initialRows = latest ? await getRowsForDates([latest]) : [];
+      setAllRows(initialRows);
+      setLoadElapsedMs(performance.now() - startedAt);
+      setLoading(false);
+
+      // Background phase: quietly fill in the rest of history (needed
+      // for the "all-time top 10 by volume" ranking used in the trend
+      // charts) without blocking the page the user is already looking at.
+      if (datesAsc.length > 1) {
+        setHistoryLoading(true);
+        getAllRowsRemote()
+          .then(fullRows => setAllRows(fullRows))
+          .catch(() => { /* the page still works with just the initial date */ })
+          .finally(() => setHistoryLoading(false));
+      }
     } catch (e) {
       setError('Could not reach the data source. Check your connection and try again.');
-    } finally {
       setLoading(false);
     }
   }, []);
 
   useEffect(() => { loadAll(); }, [loadAll]);
+
+  // If the user picks a date range that includes dates not loaded yet
+  // (e.g. before the background history fill finishes), fetch just
+  // those missing dates on demand instead of waiting for everything.
+  useEffect(() => {
+    if (!fromDate || !toDate || !allRows) return;
+    const lo = fromDate <= toDate ? fromDate : toDate;
+    const hi = fromDate <= toDate ? toDate : fromDate;
+    const needed = availableDates.filter(d => d >= lo && d <= hi);
+    const loaded = new Set(allRows.map(r => r.date));
+    const missing = needed.filter(d => !loaded.has(d));
+    if (!missing.length) return;
+    let cancelled = false;
+    getRowsForDates(missing).then(extra => {
+      if (cancelled) return;
+      setAllRows(prev => (prev || []).concat(extra));
+    });
+    return () => { cancelled = true; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [fromDate, toDate, availableDates]);
+
+  // load the saved Plan-sheet settings (ID + month suffix) once, the first
+  // time the modal is opened — falls back to the hardcoded defaults if
+  // nothing has been saved yet
+  useEffect(() => {
+    if (!showPlanModal || planSettingsLoaded) return;
+    let cancelled = false;
+    Promise.all([sheetGetMeta('plan-sheet-id'), sheetGetMeta('plan-month-suffix')])
+      .then(([savedId, savedSuffix]) => {
+        if (cancelled) return;
+        if (savedId) setPlanSheetId(savedId);
+        if (savedSuffix) setPlanMonthSuffix(savedSuffix);
+        setPlanSettingsLoaded(true);
+      })
+      .catch(() => { if (!cancelled) setPlanSettingsLoaded(true); });
+    return () => { cancelled = true; };
+  }, [showPlanModal, planSettingsLoaded]);
+
+  const savePlanSettings = useCallback(async (newSheetId, newSuffix) => {
+    setPlanSheetId(newSheetId);
+    setPlanMonthSuffix(newSuffix);
+    await Promise.all([
+      sheetSetMeta('plan-sheet-id', newSheetId),
+      sheetSetMeta('plan-month-suffix', newSuffix)
+    ]);
+  }, []);
+
+  const planTabs = useMemo(() => buildPlanTabs(planMonthSuffix), [planMonthSuffix]);
+
+  useEffect(() => {
+    if (!showPlanModal || !planSettingsLoaded) return;
+    const tab = planTabs.find(t => t.key === planTabKey);
+    if (!tab) return;
+    let cancelled = false;
+    setPlanLoading(true); setPlanError(null); setPlanDataSavedAt(null);
+
+    sheetGetMeta('plan-manual-data-' + planTabKey)
+      .then(raw => {
+        if (cancelled) return null;
+        if (raw) {
+          try {
+            const saved = JSON.parse(raw);
+            if (saved && saved.rows && saved.rows.length) {
+              setPlanData({ rows: saved.rows, total: saved.total || null });
+              setPlanDataSavedAt(saved.savedAt || null);
+              setPlanLoading(false);
+              return 'used-manual';
+            }
+          } catch (e) { /* fall through to live fetch */ }
+        }
+        return null;
+      })
+      .then(outcome => {
+        if (cancelled || outcome === 'used-manual') return;
+        // no manually-uploaded data saved yet for this tab — try the live fetch
+        return fetchPlanSheetCsv(planSheetId, tab.sheetName)
+          .then(rows => {
+            if (cancelled) return;
+            const parsed = parsePlanCatchup(rows);
+            if (!parsed.rows.length) {
+              setPlanError('Could not find a Plan/Actual/Shortfall table on the "' + tab.sheetName + '" tab, and no photo has been uploaded for it yet.');
+              setPlanData(null);
+            } else {
+              setPlanData(parsed);
+            }
+          })
+          .catch(e => { if (!cancelled) { setPlanError((e.message || 'Could not load the plan sheet.') + ' You can upload a photo of this tab instead — see Upload Photo below.'); setPlanData(null); } })
+          .finally(() => { if (!cancelled) setPlanLoading(false); });
+      });
+
+    return () => { cancelled = true; };
+  }, [showPlanModal, planTabKey, planSheetId, planTabs, planSettingsLoaded]);
+
+  const saveManualPlanData = useCallback(async (tabKey, parsed) => {
+    const savedAt = Date.now();
+    await sheetSetMeta('plan-manual-data-' + tabKey, JSON.stringify({ rows: parsed.rows, total: parsed.total, savedAt }));
+    setPlanData(parsed);
+    setPlanDataSavedAt(savedAt);
+    setPlanError(null);
+  }, []);
 
   const rows = useMemo(() => {
     if (!allRows || !fromDate || !toDate) return allRows === null ? null : [];
@@ -673,11 +1200,6 @@ function App() {
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]);
   }, [deptRows]);
 
-  // the Batch filter only makes sense while actually viewing the Batch tab
-  // — this is the one value used everywhere a "does the batch filter apply
-  // right now" check is needed, so switching to Machine wise/Alloy always
-  // behaves as if no batch were selected (search/stats/charts included),
-  // without losing the choice for whenever the user returns to Batch.
   const effectiveSelectedBatch = view === 'batch' ? selectedBatch : '';
 
   const searchedAllRows = useMemo(() => {
@@ -806,11 +1328,6 @@ function App() {
     else { setSortKey(key); setSortDir('desc'); }
   }
 
-  // clicking a row's name should reuse the SAME filter the dropdowns use,
-  // not a separate free-text search — otherwise "Machine: X" (from the
-  // dropdown) and "Search: X" (from clicking the same machine's name in
-  // the table) show up as two redundant chips for one filter, and clearing
-  // one leaves the other still narrowing the data.
   function handleNameClick(name) {
     if (view === 'wc') setSelectedMachine(name);
     else if (view === 'batch') setSelectedBatch(name);
@@ -906,6 +1423,9 @@ function App() {
         canExport={!!(rows && rows.length)}
         uploading={uploading}
         uploadProgress={uploadProgress}
+        onOpenPlan={() => setShowPlanModal(true)}
+        loadElapsedMs={loadElapsedMs}
+        historyLoading={historyLoading}
       />
       <input ref={fileInputRef} type="file" accept=".xlsx,.xls,.pdf" multiple style={{ display: 'none' }}
         onChange={e => { if (e.target.files.length) handleFiles(e.target.files); e.target.value = ''; }} />
@@ -1056,11 +1576,24 @@ function App() {
           {toast.msg}
         </div>
       )}
+
+      {showPlanModal && (
+        <PlanModal
+          onClose={() => setShowPlanModal(false)}
+          planTabKey={planTabKey} setPlanTabKey={setPlanTabKey}
+          loading={planLoading} error={planError} data={planData}
+          planTabs={planTabs}
+          planSheetId={planSheetId} planMonthSuffix={planMonthSuffix}
+          onSaveSettings={savePlanSettings}
+          planDataSavedAt={planDataSavedAt}
+          onSaveManualData={saveManualPlanData}
+        />
+      )}
     </div>
   );
 }
 
-function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress }) {
+function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, canExport, uploading, uploadProgress, onOpenPlan, loadElapsedMs, historyLoading }) {
   return (
     <header style={{ borderBottom: '1px solid var(--line)', background: 'var(--surface)', position: 'sticky', top: 0, zIndex: 10 }}>
       <div className="topbar-row" style={{ maxWidth: 1650, margin: '0 auto', padding: '14px 24px', display: 'flex', alignItems: 'center', gap: 16, flexWrap: 'wrap' }}>
@@ -1085,6 +1618,14 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
         </div>
 
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginLeft: 'auto', flexShrink: 0 }}>
+          <button onClick={onOpenPlan} className="focus-ring topbar-btn" style={{
+            display: 'flex', alignItems: 'center', gap: 7, padding: '9px 16px', borderRadius: 8,
+            border: '1px solid var(--accent)', background: 'var(--accent-soft)', color: 'var(--accent)', fontWeight: 700, fontSize: 13
+          }} title="Plan vs Actual — CCP / Coil Transfer / FG Packing">
+            <IconPlan />
+            <span className="btn-label">Plan vs Actual</span>
+          </button>
+
           <button onClick={onExport} disabled={!canExport} className="focus-ring topbar-btn" style={{
             display: 'flex', alignItems: 'center', gap: 7, padding: '9px 14px', borderRadius: 8,
             border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13,
@@ -1115,9 +1656,18 @@ function TopBar({ theme, setTheme, search, setSearch, onUploadClick, onExport, c
       </div>
       <div style={{
         maxWidth: 1650, margin: '0 auto', padding: '0 24px 10px',
-        fontSize: 12, color: 'var(--ink-2)', textAlign: 'right'
+        fontSize: 12, color: 'var(--ink-2)', textAlign: 'right',
+        display: 'flex', justifyContent: 'flex-end', alignItems: 'center', gap: 10
       }}>
-        Only upload the <strong>&ldquo;Batch Wise Cost&rdquo;</strong> sheet — work center, alloy, and batch views are generated automatically from it.
+        <span>Only upload the <strong>&ldquo;Batch Wise Cost&rdquo;</strong> sheet — work center, alloy, and batch views are generated automatically from it.</span>
+        {loadElapsedMs != null && (
+          <span style={{
+            flexShrink: 0, fontWeight: 700, color: 'var(--accent)', background: 'var(--accent-soft)',
+            padding: '2px 8px', borderRadius: 999, whiteSpace: 'nowrap'
+          }} title="Time from page open to data fully loaded">
+            Loaded in {(loadElapsedMs / 1000).toFixed(2)}s{historyLoading ? ' — loading full history…' : ''}
+          </span>
+        )}
       </div>
     </header>
   );
@@ -1306,6 +1856,317 @@ function StatRow({ qty, total, entries, fmt }) {
           <div style={{ fontSize: 21, fontWeight: 600, marginTop: 2 }}>{val}</div>
         </div>
       ))}
+    </div>
+  );
+}
+
+/* ============================================================
+   PLAN vs ACTUAL MODAL
+============================================================ */
+function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, planTabs, planSheetId, planMonthSuffix, onSaveSettings, planDataSavedAt, onSaveManualData }) {
+  const fmt = n => n == null ? '-' : Math.round(n).toLocaleString('en-IN');
+  const [showSettings, setShowSettings] = useState(false);
+  const [linkDraft, setLinkDraft] = useState(planSheetId);
+  const [suffixDraft, setSuffixDraft] = useState(planMonthSuffix);
+  const [settingsError, setSettingsError] = useState(null);
+  const [ocrLoading, setOcrLoading] = useState(false);
+  const [ocrProgress, setOcrProgress] = useState(0);
+  const [ocrError, setOcrError] = useState(null);
+  const [reviewRows, setReviewRows] = useState(null); // array of editable entries, or null when not reviewing
+  const [reviewTotal, setReviewTotal] = useState(null);
+  const photoInputRef = useRef(null);
+
+  async function handlePhotoSelected(e) {
+    const file = e.target.files && e.target.files[0];
+    e.target.value = '';
+    if (!file) return;
+    setOcrError(null); setOcrLoading(true); setOcrProgress(0);
+    try {
+      const dataRows = await extractPlanTableFromImage(file, pct => setOcrProgress(pct));
+      const parsed = fixedColumnsToEntries(dataRows);
+      if (!parsed.rows.length) throw new Error('Could not make out any product rows in that photo. Try a clearer, more zoomed-in photo of just the table.');
+      setReviewRows(parsed.rows);
+      setReviewTotal(parsed.total);
+    } catch (err) {
+      setOcrError(err.message || 'Could not read that photo.');
+    } finally {
+      setOcrLoading(false);
+    }
+  }
+
+  function updateReviewCell(index, field, value) {
+    setReviewRows(prev => {
+      const copy = [...prev];
+      copy[index] = { ...copy[index], [field]: field === 'name' ? value : parseNum(value) };
+      return copy;
+    });
+  }
+  function updateReviewTotalCell(field, value) {
+    setReviewTotal(prev => ({ ...(prev || { name: 'Total' }), [field]: field === 'name' ? value : parseNum(value) }));
+  }
+
+  async function confirmReview() {
+    await onSaveManualData(planTabKey, { rows: reviewRows, total: reviewTotal });
+    setReviewRows(null);
+    setReviewTotal(null);
+  }
+
+  // biggest shortfall first — the rows that need the most catching up
+  const sortedRows = useMemo(() => {
+    if (!data || !data.rows) return [];
+    return [...data.rows].sort((a, b) => (a.requiredPerDay ?? 0) - (b.requiredPerDay ?? 0));
+  }, [data]);
+
+  const achievement = data && data.total && data.total.planTillDate
+    ? Math.round((data.total.actualTillDate / data.total.planTillDate) * 100)
+    : null;
+
+  function handleSaveSettings() {
+    const id = extractSheetId(linkDraft);
+    if (!id) { setSettingsError('That doesn\'t look like a Google Sheets link or ID.'); return; }
+    const suf = suffixDraft.trim();
+    if (!suf) { setSettingsError('Month suffix can\'t be empty (e.g. "Sep", "Oct").'); return; }
+    setSettingsError(null);
+    onSaveSettings(id, suf);
+    setShowSettings(false);
+  }
+
+  return (
+    <div style={{
+      position: 'fixed', inset: 0, background: 'rgba(28,27,25,0.5)', zIndex: 100,
+      display: 'flex', alignItems: 'flex-start', justifyContent: 'center', padding: '32px 20px', overflowY: 'auto'
+    }} onClick={onClose}>
+      <div onClick={e => e.stopPropagation()} style={{
+        background: 'var(--bg)', borderRadius: 14, width: '100%', maxWidth: 1100,
+        maxHeight: '92vh', overflowY: 'auto', boxShadow: '0 20px 60px rgba(0,0,0,0.25)'
+      }}>
+        <div style={{
+          position: 'sticky', top: 0, background: 'var(--surface)', borderBottom: '1px solid var(--line)',
+          padding: '16px 24px', display: 'flex', alignItems: 'center', gap: 12, zIndex: 2
+        }}>
+          <span style={{ fontSize: 16, fontWeight: 700 }}>Plan vs Actual</span>
+          <button onClick={() => photoInputRef.current && photoInputRef.current.click()}
+            disabled={ocrLoading}
+            className="focus-ring"
+            style={{
+              display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8, padding: '6px 10px', borderRadius: 8,
+              border: '1px solid var(--accent)', background: 'var(--accent-soft)',
+              color: 'var(--accent)', fontSize: 12, fontWeight: 700, opacity: ocrLoading ? 0.6 : 1
+            }}>
+            <IconUpload /> {ocrLoading ? 'Reading photo… ' + ocrProgress + '%' : 'Upload Photo'}
+          </button>
+          <input ref={photoInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handlePhotoSelected} />
+          <button onClick={() => { setLinkDraft(planSheetId); setSuffixDraft(planMonthSuffix); setSettingsError(null); setShowSettings(s => !s); }}
+            className="focus-ring" aria-label="Plan sheet settings"
+            style={{
+              display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderRadius: 8,
+              border: '1px solid var(--line-strong)', background: showSettings ? 'var(--surface-2)' : 'var(--surface)',
+              color: 'var(--ink-2)', fontSize: 12, fontWeight: 600
+            }}>
+            <IconGear /> Settings
+          </button>
+          <button onClick={onClose} className="focus-ring" aria-label="Close"
+            style={{ marginLeft: 'auto', background: 'none', border: 'none', display: 'flex', padding: 6, borderRadius: 8, color: 'var(--ink-2)' }}>
+            <IconX />
+          </button>
+        </div>
+
+        {showSettings && (
+          <div style={{ padding: '16px 24px', background: 'var(--surface-2)', borderBottom: '1px solid var(--line)' }}>
+            <div style={{ fontSize: 12.5, color: 'var(--ink-2)', marginBottom: 10 }}>
+              A new Google Sheet is created for this plan every month. Paste this month's sheet link here once — no code change needed after that.
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'flex-end' }}>
+              <div style={{ flex: '1 1 320px' }}>
+                <label style={{ fontSize: 11, color: 'var(--ink-3)', display: 'block', marginBottom: 3 }}>Google Sheet link (or ID)</label>
+                <input value={linkDraft} onChange={e => setLinkDraft(e.target.value)}
+                  placeholder="https://docs.google.com/spreadsheets/d/..."
+                  className="focus-ring"
+                  style={{ width: '100%', padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)' }} />
+              </div>
+              <div style={{ width: 110 }}>
+                <label style={{ fontSize: 11, color: 'var(--ink-3)', display: 'block', marginBottom: 3 }}>Month suffix</label>
+                <input value={suffixDraft} onChange={e => setSuffixDraft(e.target.value)}
+                  placeholder="Sep"
+                  className="focus-ring"
+                  style={{ width: '100%', padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)' }} />
+              </div>
+              <button onClick={handleSaveSettings} className="focus-ring" style={{
+                padding: '8px 16px', borderRadius: 8, border: 'none', background: 'var(--accent)', color: 'var(--accent-ink)', fontWeight: 700, fontSize: 13
+              }}>Save</button>
+            </div>
+            {settingsError && <div style={{ fontSize: 12, color: 'var(--danger)', marginTop: 8 }}>{settingsError}</div>}
+            <div style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 8 }}>
+              Tab names looked for: "CCP Plan vs Actual {suffixDraft || planMonthSuffix}", "Coil Transfer Plan vs Actual {suffixDraft || planMonthSuffix}", "FG Packing Plan vs Actual {suffixDraft || planMonthSuffix}". Saved for everyone who opens this dashboard.
+            </div>
+          </div>
+        )}
+
+        <div style={{ padding: '20px 24px 28px' }}>
+          <div style={{ display: 'flex', gap: 4, background: 'var(--surface-2)', border: '1px solid var(--line)', borderRadius: 8, padding: 3, width: 'fit-content', marginBottom: 18 }}>
+            {planTabs.map(t => (
+              <button key={t.key} onClick={() => setPlanTabKey(t.key)} className="focus-ring" style={{
+                padding: '7px 16px', borderRadius: 6, border: 'none', fontSize: 13, fontWeight: 700,
+                background: t.key === planTabKey ? 'var(--surface)' : 'transparent',
+                color: t.key === planTabKey ? 'var(--ink)' : 'var(--ink-2)', cursor: 'pointer',
+                boxShadow: t.key === planTabKey ? '0 1px 2px rgba(0,0,0,0.06)' : 'none'
+              }}>{t.label}</button>
+            ))}
+          </div>
+
+          {ocrError && (
+            <div style={{ padding: '10px 14px', marginBottom: 14, background: 'var(--danger-soft)', border: '1px solid var(--danger)', borderRadius: 8, fontSize: 13, color: 'var(--danger)' }}>
+              {ocrError}
+            </div>
+          )}
+
+          {reviewRows ? (
+            <div>
+              <div style={{ fontSize: 13, color: 'var(--ink-2)', marginBottom: 10 }}>
+                Check the numbers below against the photo — OCR can misread a digit or miss a minus sign. Fix anything wrong, then confirm.
+              </div>
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden', marginBottom: 14 }}>
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
+                    <thead>
+                      <tr>
+                        {['Product', 'Total Plan', 'Plan Till Date', 'Actual Till Date', 'Shortfall Till Date', 'Total Shortfall', 'Required / day'].map(h => (
+                          <th key={h} style={{ textAlign: 'left', padding: '9px 12px', fontSize: 11.5, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {reviewRows.map((r, i) => (
+                        <tr key={i}>
+                          {['name', 'totalPlan', 'planTillDate', 'actualTillDate', 'shortfallTillDate', 'totalShortfall', 'requiredPerDay'].map(field => (
+                            <td key={field} style={{ padding: '4px 6px', borderBottom: '1px solid var(--line)' }}>
+                              <input value={r[field] == null ? '' : r[field]} onChange={e => updateReviewCell(i, field, e.target.value)}
+                                className="focus-ring" style={{ width: field === 'name' ? 130 : 80, padding: '5px 6px', borderRadius: 6, border: '1px solid var(--line)', background: 'var(--surface)' }} />
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                      <tr style={{ background: 'var(--surface-2)' }}>
+                        {['name', 'totalPlan', 'planTillDate', 'actualTillDate', 'shortfallTillDate', 'totalShortfall', 'requiredPerDay'].map(field => (
+                          <td key={field} style={{ padding: '4px 6px' }}>
+                            <input value={(reviewTotal && reviewTotal[field]) ?? (field === 'name' ? 'Total' : '')} onChange={e => updateReviewTotalCell(field, e.target.value)}
+                              className="focus-ring" style={{ width: field === 'name' ? 130 : 80, padding: '5px 6px', borderRadius: 6, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 700 }} />
+                          </td>
+                        ))}
+                      </tr>
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              <div style={{ display: 'flex', gap: 10 }}>
+                <button onClick={confirmReview} className="focus-ring" style={{ padding: '9px 18px', borderRadius: 8, border: 'none', background: 'var(--accent)', color: 'var(--accent-ink)', fontWeight: 700, fontSize: 13 }}>
+                  Confirm &amp; Use This Data
+                </button>
+                <button onClick={() => { setReviewRows(null); setReviewTotal(null); }} className="focus-ring" style={{ padding: '9px 18px', borderRadius: 8, border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13 }}>
+                  Cancel
+                </button>
+              </div>
+            </div>
+          ) : (
+          <React.Fragment>
+
+          {loading && (
+            <div style={{ padding: '48px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, color: 'var(--ink-2)' }}>
+              <span className="spin" style={{ width: 20, height: 20, border: '2.5px solid var(--line-strong)', borderTopColor: 'var(--accent)', borderRadius: '50%', display: 'inline-block' }} />
+              <span style={{ fontSize: 13 }}>Loading plan data…</span>
+            </div>
+          )}
+
+          {!loading && error && (
+            <div style={{ padding: '32px 20px', textAlign: 'center' }}>
+              <div style={{ fontWeight: 600, marginBottom: 6 }}>Could not load this plan</div>
+              <div style={{ fontSize: 13, color: 'var(--ink-2)' }}>{error}</div>
+            </div>
+          )}
+
+          {!loading && !error && data && (
+            <React.Fragment>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 10, marginBottom: 18 }}>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Total Plan</div>
+                  <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{fmt(data.total && data.total.totalPlan)}</div>
+                </div>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Total Actual</div>
+                  <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{fmt(data.total && data.total.actualTillDate)}</div>
+                </div>
+                <div style={{ background: 'var(--danger-soft)', border: '1px solid var(--danger)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--danger)' }}>Total Shortfall</div>
+                  <div style={{ fontSize: 22, fontWeight: 700, marginTop: 2, color: 'var(--danger)' }}>{fmt(data.total && data.total.totalShortfall)}</div>
+                </div>
+                <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 10, padding: '14px 16px' }}>
+                  <div style={{ fontSize: 12, color: 'var(--ink-2)' }}>Achievement</div>
+                  <div style={{ fontSize: 22, fontWeight: 600, marginTop: 2 }}>{achievement != null ? achievement + '%' : '-'}</div>
+                </div>
+              </div>
+
+              <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden' }}>
+                <div style={{ padding: '14px 20px 2px', fontSize: 13, color: 'var(--ink-2)' }}>
+                  Sorted by biggest catch-up needed first
+                </div>
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13, marginTop: 8 }}>
+                    <thead>
+                      <tr>
+                        <th style={{ textAlign: 'left', padding: '10px 20px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Product</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Total Plan</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Plan Till Date</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Actual Till Date</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Shortfall Till Date</th>
+                        <th style={{ textAlign: 'right', padding: '10px 14px', fontSize: 12, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Total Shortfall</th>
+                        <th style={{ textAlign: 'right', padding: '10px 20px', fontSize: 12, fontWeight: 700, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>Required / day</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {sortedRows.map((r, i) => {
+                        const behind = r.shortfallTillDate != null && r.shortfallTillDate < 0;
+                        const reqNeg = r.requiredPerDay != null && r.requiredPerDay < 0;
+                        return (
+                          <tr key={r.name + i}>
+                            <td style={{ padding: '9px 20px', borderBottom: '1px solid var(--line)' }}>{r.name}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.totalPlan)}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.planTillDate)}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)' }}>{fmt(r.actualTillDate)}</td>
+                            <td style={{
+                              padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)', fontWeight: behind ? 700 : 400,
+                              background: behind ? 'var(--danger-soft)' : 'transparent', color: behind ? 'var(--danger)' : (r.shortfallTillDate > 0 ? '#1E9E6B' : 'inherit')
+                            }}>{fmt(r.shortfallTillDate)}</td>
+                            <td style={{ padding: '9px 14px', textAlign: 'right', borderBottom: '1px solid var(--line)', color: r.totalShortfall < 0 ? 'var(--danger)' : (r.totalShortfall > 0 ? '#1E9E6B' : 'inherit') }}>{fmt(r.totalShortfall)}</td>
+                            <td style={{ padding: '9px 20px', textAlign: 'right', borderBottom: '1px solid var(--line)', fontWeight: 700, color: reqNeg ? 'var(--danger)' : (r.requiredPerDay > 0 ? '#1E9E6B' : 'inherit') }}>{fmt(r.requiredPerDay)}</td>
+                          </tr>
+                        );
+                      })}
+                      {data.total && (
+                        <tr>
+                          <td style={{ padding: '11px 20px', fontWeight: 700 }}>Total</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700 }}>{fmt(data.total.totalPlan)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700 }}>{fmt(data.total.planTillDate)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700 }}>{fmt(data.total.actualTillDate)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.total.shortfallTillDate)}</td>
+                          <td style={{ padding: '11px 14px', textAlign: 'right', fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.total.totalShortfall)}</td>
+                          <td style={{ padding: '11px 20px', textAlign: 'right', fontWeight: 700, color: 'var(--danger)' }}>{fmt(data.total.requiredPerDay)}</td>
+                        </tr>
+                      )}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+              {planDataSavedAt && (
+                <div style={{ fontSize: 11.5, color: 'var(--ink-3)', marginTop: 8 }}>
+                  From an uploaded photo, saved {new Date(planDataSavedAt).toLocaleString('en-IN')}.
+                </div>
+              )}
+            </React.Fragment>
+          )}
+          </React.Fragment>
+          )}
+        </div>
+      </div>
     </div>
   );
 }
