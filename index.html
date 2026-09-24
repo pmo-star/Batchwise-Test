@@ -4,6 +4,8 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Batchwise Tracker</title>
+<link rel="preconnect" href="https://firestore.googleapis.com" crossorigin>
+<link rel="dns-prefetch" href="https://firestore.googleapis.com">
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23B54E2E'/%3E%3Ctext x='16' y='23' font-family='Arial, Helvetica, sans-serif' font-size='19' font-weight='700' fill='white' text-anchor='middle'%3EB%3C/text%3E%3C/svg%3E">
 <style>
   :root {
@@ -85,7 +87,6 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/tesseract.js/5.1.1/tesseract.min.js"></script>
 
 <script type="text/babel-jsx" id="app-source">
 const { useState, useEffect, useMemo, useCallback, useRef } = React;
@@ -146,7 +147,7 @@ function buildPlanTabs(monthSuffix) {
   return [
     { key: 'ccp', label: 'CCP Plan', sheetName: 'CCP Plan vs Actual ' + suf },
     { key: 'coil', label: 'Coil Transfer Plan', sheetName: 'Coil Transfer Plan vs Actual ' + suf },
-    { key: 'fg', label: 'FG Packing', sheetName: 'FG Packing Plan vs Actual ' + suf }
+    { key: 'fg', label: 'FG Packing', sheetName: 'Revised FG Packing Plan vs Actual ' + suf }
   ];
 }
 
@@ -715,26 +716,30 @@ async function fetchPlanSheetCsv(sheetId, sheetName) {
   return json.rows || [];
 }
 
-// finds the "catch-up" summary table anywhere in the sheet by matching
-// header text (Product / Plan / Actual-or-Transferred / Shortfall /
-// Required-per-day) rather than a fixed row/column position
+// Finds the "catch-up" summary table by locating a "Product" header
+// cell. The 6 columns after it are ALWAYS, in every department's tab,
+// in this exact order: Total <X>, <X> Plan Till Date, <X actual> Till
+// Date, Shortfall Till Date, Total Shortfall, <X> Required/day — but
+// the <X> wording differs per department (CCP says "Casting"/"Casted",
+// Coil says "Transfer"/"Transfered", FG says "Packing"/"Packed", and FG's
+// first column is even labelled "Packing Target" instead of "Total ...").
+// So column identity comes from POSITION relative to "Product", not from
+// matching those varying words — only "Shortfall" (always 4 columns
+// after Product) and "Required" (always 6 columns after) are checked,
+// as a sanity check that this is really the right table.
 function findCatchupHeaderRow(rows) {
   for (let r = 0; r < rows.length; r++) {
     const cells = rows[r].map(c => (c || '').toString().trim().toLowerCase());
-    const hasProduct = cells.some(c => c === 'product');
-    const hasPlan = cells.some(c => c.includes('plan'));
-    const hasActual = cells.some(c => c.includes('actual') || c.includes('transfer'));
-    const hasShortfall = cells.some(c => c.includes('shortfall'));
-    if (hasProduct && hasPlan && hasActual && hasShortfall) return r;
+    for (let c = 0; c < cells.length; c++) {
+      if (cells[c] !== 'product') continue;
+      const shortfallTillCell = cells[c + 4] || '';
+      const requiredCell = cells[c + 6] || '';
+      if (shortfallTillCell.includes('shortfall') && requiredCell.includes('required')) {
+        return { row: r, col: c };
+      }
+    }
   }
-  return -1;
-}
-
-function colIndexMatching(headerCells, predicate) {
-  for (let i = 0; i < headerCells.length; i++) {
-    if (predicate(headerCells[i])) return i;
-  }
-  return -1;
+  return null;
 }
 
 function parseNum(v) {
@@ -744,26 +749,33 @@ function parseNum(v) {
 }
 
 function parsePlanCatchup(rows) {
-  const headerIdx = findCatchupHeaderRow(rows);
-  if (headerIdx === -1) return { rows: [], total: null };
+  const header = findCatchupHeaderRow(rows);
+  if (!header) return { rows: [], total: null };
 
-  const header = rows[headerIdx].map(c => (c || '').toString().trim().toLowerCase());
-  const cProduct = colIndexMatching(header, c => c === 'product');
-  const cTotalPlan = colIndexMatching(header, c => c.includes('total') && c.includes('plan'));
-  const cPlanTillDate = colIndexMatching(header, c => c.includes('plan') && c.includes('till'));
-  const cActualTillDate = colIndexMatching(header, c => (c.includes('transfer') || c.includes('actual')) && c.includes('till'));
-  const cShortfallTillDate = colIndexMatching(header, c => c.includes('shortfall') && c.includes('till'));
-  const cTotalShortfall = colIndexMatching(header, c => c.includes('total') && c.includes('shortfall'));
-  const cRequiredPerDay = colIndexMatching(header, c => c.includes('required'));
-
-  if (cProduct === -1) return { rows: [], total: null };
+  const { row: headerIdx, col: cProduct } = header;
+  const cTotalPlan = cProduct + 1;
+  const cPlanTillDate = cProduct + 2;
+  const cActualTillDate = cProduct + 3;
+  const cShortfallTillDate = cProduct + 4;
+  const cTotalShortfall = cProduct + 5;
+  const cRequiredPerDay = cProduct + 6;
 
   const out = [];
   let total = null;
+  let consecutiveBlanks = 0;
   for (let r = headerIdx + 1; r < rows.length; r++) {
     const row = rows[r];
     const name = (row[cProduct] || '').toString().trim();
-    if (!name) break; // blank row ends the table
+    if (!name) {
+      // Some tabs (e.g. FG Packing) have a single stray blank row right
+      // before the "Total" row, before the table truly ends — only treat
+      // TWO blank rows in a row as the real end, so that one lone blank
+      // doesn't hide the Total row that follows it.
+      consecutiveBlanks++;
+      if (consecutiveBlanks >= 2) break;
+      continue;
+    }
+    consecutiveBlanks = 0;
     const entry = {
       name,
       totalPlan: parseNum(row[cTotalPlan]),
@@ -775,6 +787,7 @@ function parsePlanCatchup(rows) {
     };
     if (name.toLowerCase() === 'total' || name.toLowerCase() === 'g.total') {
       total = entry;
+      break; // stop right after Total — rows below belong to a different table
     } else {
       out.push(entry);
     }
@@ -782,106 +795,6 @@ function parsePlanCatchup(rows) {
   return { rows: out, total };
 }
 
-/* ============================================================
-   PLAN vs ACTUAL — from a photo (OCR)
-   Tesseract reads individual words with their pixel position on
-   the image. Numbers OCR very reliably; header text often doesn't
-   (tight column spacing merges words together), so instead of
-   trying to match header labels, this assumes the catch-up
-   table's column ORDER is always: Product, Total Plan, Plan Till
-   Date, Actual Till Date, Shortfall Till Date, Total Shortfall,
-   Required/day — the same fixed layout every screenshot of this
-   table has — and reconstructs columns from word X-position,
-   the same bucketing idea used for the SAP PDF parser.
-============================================================ */
-function groupWordsIntoRows(words, yThreshold) {
-  const sorted = [...words].sort((a, b) => a.y0 - b.y0);
-  const rows = [];
-  sorted.forEach(w => {
-    const midY = (w.y0 + w.y1) / 2;
-    let row = rows.find(r => Math.abs(r.midY - midY) < yThreshold);
-    if (!row) { row = { midY, words: [] }; rows.push(row); }
-    row.words.push(w);
-    row.midY = row.words.reduce((s, ww) => s + (ww.y0 + ww.y1) / 2, 0) / row.words.length;
-  });
-  rows.sort((a, b) => a.midY - b.midY);
-  rows.forEach(r => r.words.sort((a, b) => a.x0 - b.x0));
-  return rows.map(r => r.words);
-}
-
-// a product name like "NS 20%" or "ALBR (COLUMBIA CORE)" OCRs as several
-// separate words that sit close together — merge words whose gap is small
-// relative to the text height into one cell, so they land in one column
-// bucket instead of being mistaken for several columns
-function mergeWordsIntoCells(rowWords) {
-  if (!rowWords.length) return [];
-  const avgHeight = rowWords.reduce((s, w) => s + (w.y1 - w.y0), 0) / rowWords.length;
-  const gapThreshold = Math.max(10, avgHeight * 0.9);
-  const cells = [];
-  rowWords.forEach(w => {
-    const last = cells[cells.length - 1];
-    if (last && (w.x0 - last.x1) < gapThreshold) {
-      last.text += ' ' + w.text;
-      last.x1 = Math.max(last.x1, w.x1);
-    } else {
-      cells.push({ text: w.text, x0: w.x0, x1: w.x1 });
-    }
-  });
-  return cells;
-}
-
-function bucketRowByColumns(rowCells, boundaries) {
-  const buckets = boundaries.map(() => []);
-  rowCells.forEach(c => {
-    let col = 0;
-    for (let i = 0; i < boundaries.length; i++) {
-      if (boundaries[i] <= c.x0 + 5) col = i;
-    }
-    buckets[col].push(c.text);
-  });
-  return buckets.map(b => b.join(' ').trim());
-}
-
-async function extractPlanTableFromImage(file, onProgress) {
-  const { data } = await Tesseract.recognize(file, 'eng', {
-    logger: m => { if (onProgress && m.status === 'recognizing text') onProgress(Math.round((m.progress || 0) * 100)); }
-  });
-  const words = (data.words || [])
-    .map(w => ({ text: w.text, x0: w.bbox.x0, x1: w.bbox.x1, y0: w.bbox.y0, y1: w.bbox.y1 }))
-    .filter(w => w.text.trim() !== '');
-  if (!words.length) throw new Error('Could not read any text from that image.');
-
-  const rows = groupWordsIntoRows(words, 14).map(mergeWordsIntoCells);
-  if (rows.length < 2) throw new Error('Could not detect a table (need a header row plus at least one data row).');
-
-  const dataRowCandidates = rows.slice(1);
-  let refRow = dataRowCandidates[0];
-  dataRowCandidates.forEach(r => { if (r.length > refRow.length) refRow = r; });
-  const boundaries = refRow.map(c => c.x0);
-
-  return dataRowCandidates.map(r => bucketRowByColumns(r, boundaries));
-}
-
-function fixedColumnsToEntries(dataRows) {
-  const out = [];
-  let total = null;
-  dataRows.forEach(row => {
-    const name = (row[0] || '').toString().trim();
-    if (!name) return;
-    const entry = {
-      name,
-      totalPlan: parseNum(row[1]),
-      planTillDate: parseNum(row[2]),
-      actualTillDate: parseNum(row[3]),
-      shortfallTillDate: parseNum(row[4]),
-      totalShortfall: parseNum(row[5]),
-      requiredPerDay: parseNum(row[6])
-    };
-    if (name.toLowerCase() === 'total' || name.toLowerCase() === 'g.total') total = entry;
-    else out.push(entry);
-  });
-  return { rows: out, total };
-}
 
 function IconSearch() {
   return <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>;
@@ -946,7 +859,6 @@ function App() {
   const [planSheetId, setPlanSheetId] = useState(PLAN_SHEET_ID_DEFAULT);
   const [planMonthSuffix, setPlanMonthSuffix] = useState(PLAN_MONTH_SUFFIX_DEFAULT);
   const [planSettingsLoaded, setPlanSettingsLoaded] = useState(false);
-  const [planDataSavedAt, setPlanDataSavedAt] = useState(null);
   const [loading, setLoading] = useState(true);
   const [loadElapsedMs, setLoadElapsedMs] = useState(null);
   const [error, setError] = useState(null);
@@ -1060,52 +972,24 @@ function App() {
     const tab = planTabs.find(t => t.key === planTabKey);
     if (!tab) return;
     let cancelled = false;
-    setPlanLoading(true); setPlanError(null); setPlanDataSavedAt(null);
+    setPlanLoading(true); setPlanError(null);
 
-    sheetGetMeta('plan-manual-data-' + planTabKey)
-      .then(raw => {
-        if (cancelled) return null;
-        if (raw) {
-          try {
-            const saved = JSON.parse(raw);
-            if (saved && saved.rows && saved.rows.length) {
-              setPlanData({ rows: saved.rows, total: saved.total || null });
-              setPlanDataSavedAt(saved.savedAt || null);
-              setPlanLoading(false);
-              return 'used-manual';
-            }
-          } catch (e) { /* fall through to live fetch */ }
+    fetchPlanSheetCsv(planSheetId, tab.sheetName)
+      .then(rows => {
+        if (cancelled) return;
+        const parsed = parsePlanCatchup(rows);
+        if (!parsed.rows.length) {
+          setPlanError('Could not find a Plan/Actual/Shortfall table on the "' + tab.sheetName + '" tab.');
+          setPlanData(null);
+        } else {
+          setPlanData(parsed);
         }
-        return null;
       })
-      .then(outcome => {
-        if (cancelled || outcome === 'used-manual') return;
-        // no manually-uploaded data saved yet for this tab — try the live fetch
-        return fetchPlanSheetCsv(planSheetId, tab.sheetName)
-          .then(rows => {
-            if (cancelled) return;
-            const parsed = parsePlanCatchup(rows);
-            if (!parsed.rows.length) {
-              setPlanError('Could not find a Plan/Actual/Shortfall table on the "' + tab.sheetName + '" tab, and no photo has been uploaded for it yet.');
-              setPlanData(null);
-            } else {
-              setPlanData(parsed);
-            }
-          })
-          .catch(e => { if (!cancelled) { setPlanError((e.message || 'Could not load the plan sheet.') + ' You can upload a photo of this tab instead — see Upload Photo below.'); setPlanData(null); } })
-          .finally(() => { if (!cancelled) setPlanLoading(false); });
-      });
+      .catch(e => { if (!cancelled) { setPlanError(e.message || 'Could not load the plan sheet.'); setPlanData(null); } })
+      .finally(() => { if (!cancelled) setPlanLoading(false); });
 
     return () => { cancelled = true; };
   }, [showPlanModal, planTabKey, planSheetId, planTabs, planSettingsLoaded]);
-
-  const saveManualPlanData = useCallback(async (tabKey, parsed) => {
-    const savedAt = Date.now();
-    await sheetSetMeta('plan-manual-data-' + tabKey, JSON.stringify({ rows: parsed.rows, total: parsed.total, savedAt }));
-    setPlanData(parsed);
-    setPlanDataSavedAt(savedAt);
-    setPlanError(null);
-  }, []);
 
   const rows = useMemo(() => {
     if (!allRows || !fromDate || !toDate) return allRows === null ? null : [];
@@ -1585,8 +1469,6 @@ function App() {
           planTabs={planTabs}
           planSheetId={planSheetId} planMonthSuffix={planMonthSuffix}
           onSaveSettings={savePlanSettings}
-          planDataSavedAt={planDataSavedAt}
-          onSaveManualData={saveManualPlanData}
         />
       )}
     </div>
@@ -1863,53 +1745,20 @@ function StatRow({ qty, total, entries, fmt }) {
 /* ============================================================
    PLAN vs ACTUAL MODAL
 ============================================================ */
-function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, planTabs, planSheetId, planMonthSuffix, onSaveSettings, planDataSavedAt, onSaveManualData }) {
+function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, planTabs, planSheetId, planMonthSuffix, onSaveSettings }) {
   const fmt = n => n == null ? '-' : Math.round(n).toLocaleString('en-IN');
   const [showSettings, setShowSettings] = useState(false);
   const [linkDraft, setLinkDraft] = useState(planSheetId);
   const [suffixDraft, setSuffixDraft] = useState(planMonthSuffix);
   const [settingsError, setSettingsError] = useState(null);
-  const [ocrLoading, setOcrLoading] = useState(false);
-  const [ocrProgress, setOcrProgress] = useState(0);
-  const [ocrError, setOcrError] = useState(null);
-  const [reviewRows, setReviewRows] = useState(null); // array of editable entries, or null when not reviewing
-  const [reviewTotal, setReviewTotal] = useState(null);
-  const photoInputRef = useRef(null);
 
-  async function handlePhotoSelected(e) {
-    const file = e.target.files && e.target.files[0];
-    e.target.value = '';
-    if (!file) return;
-    setOcrError(null); setOcrLoading(true); setOcrProgress(0);
-    try {
-      const dataRows = await extractPlanTableFromImage(file, pct => setOcrProgress(pct));
-      const parsed = fixedColumnsToEntries(dataRows);
-      if (!parsed.rows.length) throw new Error('Could not make out any product rows in that photo. Try a clearer, more zoomed-in photo of just the table.');
-      setReviewRows(parsed.rows);
-      setReviewTotal(parsed.total);
-    } catch (err) {
-      setOcrError(err.message || 'Could not read that photo.');
-    } finally {
-      setOcrLoading(false);
-    }
-  }
-
-  function updateReviewCell(index, field, value) {
-    setReviewRows(prev => {
-      const copy = [...prev];
-      copy[index] = { ...copy[index], [field]: field === 'name' ? value : parseNum(value) };
-      return copy;
-    });
-  }
-  function updateReviewTotalCell(field, value) {
-    setReviewTotal(prev => ({ ...(prev || { name: 'Total' }), [field]: field === 'name' ? value : parseNum(value) }));
-  }
-
-  async function confirmReview() {
-    await onSaveManualData(planTabKey, { rows: reviewRows, total: reviewTotal });
-    setReviewRows(null);
-    setReviewTotal(null);
-  }
+  // Lock background page scroll while this modal is open — otherwise
+  // scrolling inside the modal also scrolls the tracker page behind it.
+  useEffect(() => {
+    const prev = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => { document.body.style.overflow = prev; };
+  }, []);
 
   // biggest shortfall first — the rows that need the most catching up
   const sortedRows = useMemo(() => {
@@ -1945,21 +1794,10 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
           padding: '16px 24px', display: 'flex', alignItems: 'center', gap: 12, zIndex: 2
         }}>
           <span style={{ fontSize: 16, fontWeight: 700 }}>Plan vs Actual</span>
-          <button onClick={() => photoInputRef.current && photoInputRef.current.click()}
-            disabled={ocrLoading}
-            className="focus-ring"
-            style={{
-              display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8, padding: '6px 10px', borderRadius: 8,
-              border: '1px solid var(--accent)', background: 'var(--accent-soft)',
-              color: 'var(--accent)', fontSize: 12, fontWeight: 700, opacity: ocrLoading ? 0.6 : 1
-            }}>
-            <IconUpload /> {ocrLoading ? 'Reading photo… ' + ocrProgress + '%' : 'Upload Photo'}
-          </button>
-          <input ref={photoInputRef} type="file" accept="image/*" style={{ display: 'none' }} onChange={handlePhotoSelected} />
           <button onClick={() => { setLinkDraft(planSheetId); setSuffixDraft(planMonthSuffix); setSettingsError(null); setShowSettings(s => !s); }}
             className="focus-ring" aria-label="Plan sheet settings"
             style={{
-              display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderRadius: 8,
+              display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8, padding: '6px 10px', borderRadius: 8,
               border: '1px solid var(--line-strong)', background: showSettings ? 'var(--surface-2)' : 'var(--surface)',
               color: 'var(--ink-2)', fontSize: 12, fontWeight: 600
             }}>
@@ -1997,7 +1835,7 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
             </div>
             {settingsError && <div style={{ fontSize: 12, color: 'var(--danger)', marginTop: 8 }}>{settingsError}</div>}
             <div style={{ fontSize: 11, color: 'var(--ink-3)', marginTop: 8 }}>
-              Tab names looked for: "CCP Plan vs Actual {suffixDraft || planMonthSuffix}", "Coil Transfer Plan vs Actual {suffixDraft || planMonthSuffix}", "FG Packing Plan vs Actual {suffixDraft || planMonthSuffix}". Saved for everyone who opens this dashboard.
+              Tab names looked for: "CCP Plan vs Actual {suffixDraft || planMonthSuffix}", "Coil Transfer Plan vs Actual {suffixDraft || planMonthSuffix}", "Revised FG Packing Plan vs Actual {suffixDraft || planMonthSuffix}". Saved for everyone who opens this dashboard.
             </div>
           </div>
         )}
@@ -2013,62 +1851,6 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
               }}>{t.label}</button>
             ))}
           </div>
-
-          {ocrError && (
-            <div style={{ padding: '10px 14px', marginBottom: 14, background: 'var(--danger-soft)', border: '1px solid var(--danger)', borderRadius: 8, fontSize: 13, color: 'var(--danger)' }}>
-              {ocrError}
-            </div>
-          )}
-
-          {reviewRows ? (
-            <div>
-              <div style={{ fontSize: 13, color: 'var(--ink-2)', marginBottom: 10 }}>
-                Check the numbers below against the photo — OCR can misread a digit or miss a minus sign. Fix anything wrong, then confirm.
-              </div>
-              <div style={{ background: 'var(--surface)', border: '1px solid var(--line)', borderRadius: 12, overflow: 'hidden', marginBottom: 14 }}>
-                <div style={{ overflowX: 'auto' }}>
-                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 13 }}>
-                    <thead>
-                      <tr>
-                        {['Product', 'Total Plan', 'Plan Till Date', 'Actual Till Date', 'Shortfall Till Date', 'Total Shortfall', 'Required / day'].map(h => (
-                          <th key={h} style={{ textAlign: 'left', padding: '9px 12px', fontSize: 11.5, fontWeight: 600, color: 'var(--ink-2)', borderBottom: '1px solid var(--line)' }}>{h}</th>
-                        ))}
-                      </tr>
-                    </thead>
-                    <tbody>
-                      {reviewRows.map((r, i) => (
-                        <tr key={i}>
-                          {['name', 'totalPlan', 'planTillDate', 'actualTillDate', 'shortfallTillDate', 'totalShortfall', 'requiredPerDay'].map(field => (
-                            <td key={field} style={{ padding: '4px 6px', borderBottom: '1px solid var(--line)' }}>
-                              <input value={r[field] == null ? '' : r[field]} onChange={e => updateReviewCell(i, field, e.target.value)}
-                                className="focus-ring" style={{ width: field === 'name' ? 130 : 80, padding: '5px 6px', borderRadius: 6, border: '1px solid var(--line)', background: 'var(--surface)' }} />
-                            </td>
-                          ))}
-                        </tr>
-                      ))}
-                      <tr style={{ background: 'var(--surface-2)' }}>
-                        {['name', 'totalPlan', 'planTillDate', 'actualTillDate', 'shortfallTillDate', 'totalShortfall', 'requiredPerDay'].map(field => (
-                          <td key={field} style={{ padding: '4px 6px' }}>
-                            <input value={(reviewTotal && reviewTotal[field]) ?? (field === 'name' ? 'Total' : '')} onChange={e => updateReviewTotalCell(field, e.target.value)}
-                              className="focus-ring" style={{ width: field === 'name' ? 130 : 80, padding: '5px 6px', borderRadius: 6, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 700 }} />
-                          </td>
-                        ))}
-                      </tr>
-                    </tbody>
-                  </table>
-                </div>
-              </div>
-              <div style={{ display: 'flex', gap: 10 }}>
-                <button onClick={confirmReview} className="focus-ring" style={{ padding: '9px 18px', borderRadius: 8, border: 'none', background: 'var(--accent)', color: 'var(--accent-ink)', fontWeight: 700, fontSize: 13 }}>
-                  Confirm &amp; Use This Data
-                </button>
-                <button onClick={() => { setReviewRows(null); setReviewTotal(null); }} className="focus-ring" style={{ padding: '9px 18px', borderRadius: 8, border: '1px solid var(--line-strong)', background: 'var(--surface)', fontWeight: 600, fontSize: 13 }}>
-                  Cancel
-                </button>
-              </div>
-            </div>
-          ) : (
-          <React.Fragment>
 
           {loading && (
             <div style={{ padding: '48px 20px', display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 12, color: 'var(--ink-2)' }}>
@@ -2156,14 +1938,7 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
                   </table>
                 </div>
               </div>
-              {planDataSavedAt && (
-                <div style={{ fontSize: 11.5, color: 'var(--ink-3)', marginTop: 8 }}>
-                  From an uploaded photo, saved {new Date(planDataSavedAt).toLocaleString('en-IN')}.
-                </div>
-              )}
             </React.Fragment>
-          )}
-          </React.Fragment>
           )}
         </div>
       </div>
