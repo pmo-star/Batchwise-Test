@@ -1982,6 +1982,35 @@ function MultiValueCell({ value }) {
 
 const TREND_LINE_COLORS = ['#B54E2E', '#2E6FBF', '#1E9E6B', '#D9A400', '#C0568A', '#6B4FBF', '#2AA198', '#C4453A', '#7A8B3F', '#8B5A2B'];
 
+// Draws the target's numeric value directly on its dashed line (near the
+// chart's right edge) — Chart.js has no built-in on-line data labels, so
+// this is a small custom plugin rather than pulling in an extra library.
+// Any dataset flagged `isTarget: true` gets its value drawn this way.
+const targetLineLabelPlugin = {
+  id: 'targetLineLabel',
+  afterDatasetsDraw(chart) {
+    const datasets = chart.data.datasets || [];
+    const idx = datasets.findIndex(d => d.isTarget);
+    if (idx === -1) return;
+    const ds = datasets[idx];
+    const yScale = chart.scales.y;
+    const chartArea = chart.chartArea;
+    if (!yScale || !chartArea) return;
+    const value = ds.data.find(v => v != null);
+    if (value == null) return;
+    const yPixel = yScale.getPixelForValue(value);
+    const ctx = chart.ctx;
+    const text = value.toFixed(2);
+    ctx.save();
+    ctx.font = 'bold 11px -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Arial, sans-serif';
+    ctx.fillStyle = ds.borderColor || '#1E9E6B';
+    ctx.textAlign = 'right';
+    ctx.textBaseline = 'bottom';
+    ctx.fillText(text, chartArea.right - 4, yPixel - 3);
+    ctx.restore();
+  }
+};
+
 function buildAlloyTrendData(allRows, department, groupValues, groupField, fromDate, toDate, metricFields) {
   groupField = groupField || 'mat';
   metricFields = metricFields || ['total'];
@@ -2041,12 +2070,91 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
     [allRows, department, alloys, groupField, fromDate, toDate, metricFields]
   );
 
+  // Target = whichever machine/alloy currently has the LOWEST cost per kg,
+  // drawn as a flat reference line so every other line/bar can be judged
+  // against "the best achieved so far" instead of in isolation.
+  const target = useMemo(() => {
+    let minVal = null, minLabel = null;
+    rateDatasets.forEach(ds => {
+      (ds.data || []).forEach(v => {
+        if (v != null && (minVal === null || v < minVal)) { minVal = v; minLabel = ds.label; }
+      });
+    });
+    return minVal != null ? { value: minVal, label: minLabel } : null;
+  }, [rateDatasets]);
+
+  const singleDay = dates.length === 1;
+
   useEffect(() => {
     if (!canvasRef.current || typeof Chart === 'undefined') return;
     if (chartRef.current) chartRef.current.destroy();
+
+    if (singleDay) {
+      // A "trend" with only one date has nothing to draw a line between —
+      // show it as a bar comparison across machines/alloys instead of a
+      // line chart with a single dot per series.
+      const labels = rateDatasets.map(ds => ds.label);
+      const values = rateDatasets.map(ds => (ds.data && ds.data[0] != null) ? ds.data[0] : null);
+      const datasets = [{
+        type: 'bar',
+        label: yAxisLabel || 'Rs / kg',
+        data: values,
+        backgroundColor: '#B54E2E',
+        borderRadius: 4
+      }];
+      if (target) {
+        datasets.push({
+          type: 'line',
+          isTarget: true,
+          label: 'Target: ' + target.label + ' (' + target.value.toFixed(2) + ')',
+          data: labels.map(() => target.value),
+          borderColor: '#1E9E6B',
+          borderDash: [6, 4],
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: false
+        });
+      }
+      chartRef.current = new Chart(canvasRef.current, {
+        data: { labels, datasets },
+        plugins: [targetLineLabelPlugin],
+        options: {
+          responsive: true,
+          maintainAspectRatio: false,
+          plugins: {
+            legend: { display: true, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
+            tooltip: {
+              callbacks: {
+                label: ctx => ctx.dataset.label + ': ' + (ctx.parsed.y != null ? ctx.parsed.y.toFixed(2) + ' Rs/kg' : 'no data')
+              }
+            }
+          },
+          scales: {
+            x: { ticks: { autoSkip: false, maxRotation: 45 }, grid: { display: false } },
+            y: { title: { display: true, text: yAxisLabel || 'Rs / kg' }, beginAtZero: true, grid: { color: '#E7E2D8' } }
+          }
+        }
+      });
+      return () => { if (chartRef.current) chartRef.current.destroy(); };
+    }
+
+    const datasets = target
+      ? [...rateDatasets, {
+          isTarget: true,
+          label: 'Target: ' + target.label + ' (' + target.value.toFixed(2) + ')',
+          data: dates.map(() => target.value),
+          borderColor: '#1E9E6B',
+          borderDash: [6, 4],
+          borderWidth: 2,
+          pointRadius: 0,
+          fill: false
+        }]
+      : rateDatasets;
+
     chartRef.current = new Chart(canvasRef.current, {
       type: 'line',
-      data: { labels: dates.map(keyToLabel), datasets: rateDatasets },
+      data: { labels: dates.map(keyToLabel), datasets },
+      plugins: [targetLineLabelPlugin],
       options: {
         responsive: true,
         maintainAspectRatio: false,
@@ -2075,7 +2183,7 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
       }
     });
     return () => { if (chartRef.current) chartRef.current.destroy(); };
-  }, [dates, rateDatasets, totalQtyByDate]);
+  }, [dates, rateDatasets, totalQtyByDate, target, singleDay, yAxisLabel]);
 
   if (!rateDatasets.length) {
     return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No trend data yet.</div>;
@@ -2083,13 +2191,8 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
 
   return (
     <div>
-      {dates.length <= 1 && (
-        <div style={{ fontSize: 12, color: 'var(--ink-3)', marginBottom: 6 }}>
-          Only one date selected — widen the From/To range above to see a trend line instead of single points.
-        </div>
-      )}
       <div style={{ position: 'relative', height: 280 }}>
-        <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Line chart of Rs per kg cost over time. Hover a point to see quantity."}></canvas>
+        <canvas ref={canvasRef} role="img" aria-label={ariaLabel || "Chart of Rs per kg cost, with a target line for the lowest-cost option."}></canvas>
       </div>
     </div>
   );
@@ -2101,30 +2204,56 @@ function BatchRateBarChart({ rows, metricKey, yAxisLabel, ariaLabel }) {
   const key = metricKey || 'rate';
   const capped = useMemo(() => rows.slice(0, 25), [rows]);
 
+  // Target = the batch with the lowest cost per kg among those shown —
+  // drawn as a flat reference line, same idea as the trend charts above.
+  const target = useMemo(() => {
+    let minVal = null, minName = null;
+    capped.forEach(r => {
+      const v = r[key];
+      if (v != null && (minVal === null || v < minVal)) { minVal = v; minName = r.name; }
+    });
+    return minVal != null ? { value: minVal, name: minName } : null;
+  }, [capped, key]);
+
   useEffect(() => {
     if (!canvasRef.current || typeof Chart === 'undefined') return;
     if (chartRef.current) chartRef.current.destroy();
-    chartRef.current = new Chart(canvasRef.current, {
+    const datasets = [{
       type: 'bar',
+      data: capped.map(r => r[key]),
+      backgroundColor: '#B54E2E',
+      borderRadius: 4,
+      barThickness: 20
+    }];
+    if (target) {
+      datasets.push({
+        type: 'line',
+        isTarget: true,
+        label: 'Target: ' + target.name + ' (' + target.value.toFixed(2) + ')',
+        data: capped.map(() => target.value),
+        borderColor: '#1E9E6B',
+        borderDash: [6, 4],
+        borderWidth: 2,
+        pointRadius: 0,
+        fill: false
+      });
+    }
+    chartRef.current = new Chart(canvasRef.current, {
       data: {
         labels: capped.map(r => r.name),
-        datasets: [{
-          data: capped.map(r => r[key]),
-          backgroundColor: '#B54E2E',
-          borderRadius: 4,
-          barThickness: 20
-        }]
+        datasets
       },
+      plugins: [targetLineLabelPlugin],
       options: {
         responsive: true,
         maintainAspectRatio: false,
         interaction: { mode: 'index', intersect: false },
         plugins: {
-          legend: { display: false },
+          legend: { display: !!target, position: 'bottom', labels: { boxWidth: 12, boxHeight: 12, font: { size: 11 } } },
           tooltip: {
             callbacks: {
-              label: ctx => ctx.parsed.y.toFixed(2) + ' Rs/kg',
-              afterLabel: ctx => Math.round(capped[ctx.dataIndex].qty).toLocaleString('en-IN') + ' kg'
+              label: ctx => ctx.datasetIndex === 0 ? ctx.parsed.y.toFixed(2) + ' Rs/kg' : ctx.dataset.label,
+              afterLabel: ctx => ctx.datasetIndex === 0 ? Math.round(capped[ctx.dataIndex].qty).toLocaleString('en-IN') + ' kg' : undefined
             }
           }
         },
@@ -2135,7 +2264,7 @@ function BatchRateBarChart({ rows, metricKey, yAxisLabel, ariaLabel }) {
       }
     });
     return () => { if (chartRef.current) chartRef.current.destroy(); };
-  }, [capped, key]);
+  }, [capped, key, target]);
 
   if (!capped.length) {
     return <div style={{ fontSize: 13, color: 'var(--ink-2)', padding: '12px 0' }}>No batch data yet.</div>;
