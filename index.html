@@ -1086,16 +1086,15 @@ function App() {
 
   const effectiveSelectedBatch = view === 'batch' ? selectedBatch : '';
 
+  // Used only to rank/plot "top 10 by volume" machines & alloys for the
+  // trend charts — deliberately NOT scoped to the selected machine/batch
+  // (that selection is always-on now, for the data table below; if this
+  // also filtered by it, the "top 10" comparison would collapse to just
+  // that one machine). Free-text search still applies, since that's a
+  // genuine cross-cutting filter rather than a fixed default selection.
   const searchedAllRows = useMemo(() => {
     if (!allRows) return allRows;
     let result = allRows;
-    if (selectedMachine) {
-      const normM = normKey(selectedMachine);
-      result = result.filter(r => normKey(r.wc || '') === normM);
-    }
-    if (effectiveSelectedBatch) {
-      result = result.filter(r => r.batch === effectiveSelectedBatch);
-    }
     if (search.trim()) {
       const q = search.trim().toLowerCase();
       result = result.filter(r =>
@@ -1105,7 +1104,7 @@ function App() {
       );
     }
     return result;
-  }, [allRows, search, selectedMachine, effectiveSelectedBatch]);
+  }, [allRows, search]);
 
   const allTimeAlloyOptions = useMemo(() => {
     if (!searchedAllRows) return [];
@@ -2109,7 +2108,10 @@ function AlloyTrendChart({ allRows, department, alloys, groupField, fromDate, to
         label: yAxisLabel || 'Rs / kg',
         data: values,
         backgroundColor: '#B54E2E',
-        borderRadius: 4
+        borderRadius: 4,
+        maxBarThickness: 48,
+        categoryPercentage: 0.6,
+        barPercentage: 0.9
       }];
       if (target) {
         datasets.push({
