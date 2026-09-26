@@ -1148,9 +1148,23 @@ function App() {
     setSelectedBatch('');
   }, [department]);
 
+  // No "All machines"/"All batches" option in the dropdowns anymore — a
+  // machine (and, on the Batch tab, a batch) is always selected. Whenever
+  // the current selection is missing or no longer valid for this
+  // department/machine (empty after a department change, or the batch
+  // list changed under it), fall back to the top one by volume.
   useEffect(() => {
-    if (selectedBatch && !batchOptions.includes(selectedBatch)) setSelectedBatch('');
-  }, [batchOptions, selectedBatch]);
+    if (machineOptions.length && !machineOptions.includes(selectedMachine)) {
+      setSelectedMachine(machineOptions[0]);
+    }
+  }, [machineOptions, selectedMachine]);
+
+  useEffect(() => {
+    if (view !== 'batch') return;
+    if (batchOptions.length && !batchOptions.includes(selectedBatch)) {
+      setSelectedBatch(batchOptions[0]);
+    }
+  }, [view, batchOptions, selectedBatch]);
 
   const aggregated = useMemo(() => {
     if (view === 'wc') return aggregateBy(deptRows, r => r.date + '||' + normKey(r.wc), r => normKey(r.wc));
@@ -1702,7 +1716,6 @@ function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, depart
           className="focus-ring"
           style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 600 }}
         >
-          <option value="">All machines</option>
           {machineOptions.map(m => <option key={m} value={m}>{m}</option>)}
         </select>
       )}
@@ -1710,14 +1723,10 @@ function FilterBar({ dateIndex, fromDate, setFromDate, toDate, setToDate, depart
       {view === 'batch' && batchOptions && batchOptions.length > 0 && (
         <select
           value={selectedBatch}
-          onChange={e => {
-            setSelectedBatch(e.target.value);
-            if (e.target.value) setView('batch');
-          }}
+          onChange={e => setSelectedBatch(e.target.value)}
           className="focus-ring"
           style={{ padding: '8px 10px', borderRadius: 8, border: '1px solid var(--line)', background: 'var(--surface)', fontWeight: 600 }}
         >
-          <option value="">All batches</option>
           {batchOptions.map(b => <option key={b} value={b}>{b}</option>)}
         </select>
       )}
