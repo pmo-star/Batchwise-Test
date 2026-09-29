@@ -1107,12 +1107,21 @@ function App() {
     return result;
   }, [allRows, search, selectedMachine, effectiveSelectedBatch]);
 
+  // Scoped to the selected From/To date range — not all-time history —
+  // so an alloy/machine only appears here (and as a category in the
+  // trend charts) if it actually has data in the range currently being
+  // looked at, matching what's really in the uploaded file(s) for that
+  // period rather than showing empty columns for alloys only seen on
+  // some other, unrelated day.
   const allTimeAlloyOptions = useMemo(() => {
-    if (!searchedAllRows) return [];
+    if (!searchedAllRows || !fromDate || !toDate) return [];
+    const lo = fromDate <= toDate ? fromDate : toDate;
+    const hi = fromDate <= toDate ? toDate : fromDate;
     const totals = {};
     const display = {};
     searchedAllRows.forEach(r => {
       if (r.dept !== department || !r.mat) return;
+      if (r.date < lo || r.date > hi) return;
       const nameLower = r.mat.toLowerCase();
       if (nameLower.includes('dross') || nameLower.includes('scrap')) return;
       const key = normKey(r.mat);
@@ -1120,18 +1129,21 @@ function App() {
       if (!display[key]) display[key] = r.mat.trim();
     });
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10).map(k => display[k]);
-  }, [searchedAllRows, department]);
+  }, [searchedAllRows, department, fromDate, toDate]);
 
   const allTimeMachineOptions = useMemo(() => {
-    if (!searchedAllRows) return [];
+    if (!searchedAllRows || !fromDate || !toDate) return [];
+    const lo = fromDate <= toDate ? fromDate : toDate;
+    const hi = fromDate <= toDate ? toDate : fromDate;
     const totals = {};
     searchedAllRows.forEach(r => {
       if (r.dept !== department || !r.wc) return;
+      if (r.date < lo || r.date > hi) return;
       const key = normKey(r.wc);
       totals[key] = (totals[key] || 0) + r.qty;
     });
     return Object.keys(totals).sort((a, b) => totals[b] - totals[a]).slice(0, 10);
-  }, [searchedAllRows, department]);
+  }, [searchedAllRows, department, fromDate, toDate]);
 
   useEffect(() => {
     if (view === 'batch' && !hasBatch) setView('wc');
@@ -1797,7 +1809,7 @@ function PlanModal({ onClose, planTabKey, setPlanTabKey, loading, error, data, p
           <button onClick={() => { setLinkDraft(planSheetId); setSuffixDraft(planMonthSuffix); setSettingsError(null); setShowSettings(s => !s); }}
             className="focus-ring" aria-label="Plan sheet settings"
             style={{
-              display: 'flex', alignItems: 'center', gap: 6, marginLeft: 8, padding: '6px 10px', borderRadius: 8,
+              display: 'flex', alignItems: 'center', gap: 6, padding: '6px 10px', borderRadius: 8,
               border: '1px solid var(--line-strong)', background: showSettings ? 'var(--surface-2)' : 'var(--surface)',
               color: 'var(--ink-2)', fontSize: 12, fontWeight: 600
             }}>
